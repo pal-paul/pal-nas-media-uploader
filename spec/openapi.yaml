@@ -1,0 +1,517 @@
+openapi: 3.1.0
+info:
+  title: PAL NAS Media Uploader API
+  version: 1.0.0
+  description: |
+    Authenticated, resumable media uploads with TOTP enrollment and login.
+    Upload parts are zero-indexed and must be sent in fixed 8 MiB chunks,
+    except for the final part.
+servers:
+  - url: http://localhost:{port}
+    description: Local Docker Compose environment
+    variables:
+      port:
+        default: "8081"
+tags:
+  - name: Authentication
+    description: Password, TOTP enrollment, sessions, and logout.
+  - name: Uploads
+    description: Resumable chunk upload creation, transfer, status, completion, and cancellation.
+security:
+  - sessionCookie: []
+paths:
+  /auth/login:
+    post:
+      tags: [Authentication]
+      operationId: beginLogin
+      summary: Begin password and TOTP login
+      description: |
+        Validates the username and password and creates a challenge valid for
+        five minutes. When TOTP has not been configured, the response also
+        includes enrollment details.
+      security: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/LoginRequest"
+      responses:
+        "200":
+          description: Login challenge created.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/LoginChallenge"
+        "400":
+          $ref: "#/components/responses/BadRequest"
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+        "403":
+          $ref: "#/components/responses/ForbiddenOrigin"
+        "500":
+          $ref: "#/components/responses/InternalServerError"
+  /auth/verify:
+    post:
+      tags: [Authentication]
+      operationId: verifyTOTP
+      summary: Verify TOTP and create a session
+      description: |
+        Validates the challenge and six-digit TOTP code. For first-time login,
+        this also enables the pending TOTP secret. A successful response sets
+        an HttpOnly session cookie valid for 30 days.
+      security: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/VerifyTOTPRequest"
+      responses:
+        "200":
+          description: Authenticated session created.
+          headers:
+            Set-Cookie:
+              description: HttpOnly session cookie named pal_medias_uploader_session.
+              schema:
+                type: string
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/AuthenticatedResponse"
+        "400":
+          $ref: "#/components/responses/BadRequest"
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+        "403":
+          $ref: "#/components/responses/ForbiddenOrigin"
+        "500":
+          $ref: "#/components/responses/InternalServerError"
+  /auth/session:
+    get:
+      tags: [Authentication]
+      operationId: getSession
+      summary: Get the current session
+      responses:
+        "200":
+          description: Current authenticated user.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/SessionResponse"
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+        "403":
+          $ref: "#/components/responses/ForbiddenOrigin"
+  /auth/logout:
+    post:
+      tags: [Authentication]
+      operationId: logout
+      summary: Delete the current session
+      responses:
+        "204":
+          description: Session deleted and cookie expired.
+          headers:
+            Set-Cookie:
+              description: Expired pal_medias_uploader_session cookie.
+              schema:
+                type: string
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+        "403":
+          $ref: "#/components/responses/ForbiddenOrigin"
+  /media/upload:
+    post:
+      tags: [Uploads]
+      operationId: createUpload
+      summary: Create an upload session
+      description: |
+        Creates a resumable upload and returns its fixed chunk size and chunk
+        count. The JSON request body is limited to 64 KiB.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/CreateUploadRequest"
+      responses:
+        "201":
+          description: Upload session created.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/CreateUploadResponse"
+        "400":
+          $ref: "#/components/responses/UploadBadRequest"
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+        "403":
+          $ref: "#/components/responses/ForbiddenOrigin"
+        "500":
+          $ref: "#/components/responses/InternalServerError"
+  /media/upload/{id}:
+    parameters:
+      - $ref: "#/components/parameters/UploadID"
+    get:
+      tags: [Uploads]
+      operationId: getUploadStatus
+      summary: Get uploaded parts
+      responses:
+        "200":
+          description: Active upload status.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/UploadStatusResponse"
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+        "403":
+          $ref: "#/components/responses/ForbiddenOrigin"
+        "404":
+          $ref: "#/components/responses/UploadNotFound"
+    delete:
+      tags: [Uploads]
+      operationId: deleteUpload
+      summary: Cancel and delete an upload
+      description: Deletes temporary metadata and all uploaded parts.
+      responses:
+        "200":
+          description: Upload deleted.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/DeleteUploadResponse"
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+        "403":
+          $ref: "#/components/responses/ForbiddenOrigin"
+        "404":
+          $ref: "#/components/responses/UploadNotFound"
+        "500":
+          $ref: "#/components/responses/InternalServerError"
+  /media/upload/{id}/parts/{part}:
+    put:
+      tags: [Uploads]
+      operationId: uploadPart
+      summary: Upload or replace one part
+      description: |
+        Uploads raw bytes for a zero-indexed part. Every part must contain
+        exactly 8,388,608 bytes except the final part, whose expected size is
+        derived from the declared total size. Repeating a part replaces it.
+      parameters:
+        - $ref: "#/components/parameters/UploadID"
+        - $ref: "#/components/parameters/PartNumber"
+      requestBody:
+        required: true
+        content:
+          application/octet-stream:
+            schema:
+              type: string
+              format: binary
+      responses:
+        "200":
+          description: Part stored.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/UploadPartResponse"
+        "400":
+          $ref: "#/components/responses/UploadBadRequest"
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+        "403":
+          $ref: "#/components/responses/ForbiddenOrigin"
+        "404":
+          $ref: "#/components/responses/UploadNotFound"
+        "500":
+          $ref: "#/components/responses/InternalServerError"
+  /media/upload/{id}/complete:
+    post:
+      tags: [Uploads]
+      operationId: completeUpload
+      summary: Assemble and persist an upload
+      description: |
+        Concatenates all parts, verifies total size and optional client SHA-256,
+        stores the completed file, saves its metadata, and removes temporary
+        chunks. The returned SHA-256 is always computed by the server.
+      parameters:
+        - $ref: "#/components/parameters/UploadID"
+      responses:
+        "200":
+          description: Upload completed.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/CompleteUploadResponse"
+        "400":
+          $ref: "#/components/responses/UploadBadRequest"
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+        "403":
+          $ref: "#/components/responses/ForbiddenOrigin"
+        "404":
+          $ref: "#/components/responses/UploadNotFound"
+        "409":
+          $ref: "#/components/responses/MissingPart"
+        "500":
+          $ref: "#/components/responses/InternalServerError"
+components:
+  securitySchemes:
+    sessionCookie:
+      type: apiKey
+      in: cookie
+      name: pal_medias_uploader_session
+      description: Opaque session token issued after successful TOTP verification.
+  parameters:
+    UploadID:
+      name: id
+      in: path
+      required: true
+      description: 32-character lowercase hexadecimal upload identifier.
+      schema:
+        type: string
+        pattern: "^[0-9a-f]{32}$"
+    PartNumber:
+      name: part
+      in: path
+      required: true
+      description: Zero-indexed part number; must be less than the upload's chunk count.
+      schema:
+        type: integer
+        format: int64
+        minimum: 0
+  schemas:
+    LoginRequest:
+      type: object
+      additionalProperties: false
+      required: [username, password]
+      properties:
+        username:
+          type: string
+          minLength: 1
+          examples: [admin]
+        password:
+          type: string
+          format: password
+          minLength: 1
+    LoginChallenge:
+      type: object
+      additionalProperties: false
+      required: [challengeToken]
+      properties:
+        challengeToken:
+          type: string
+          description: Opaque challenge valid for five minutes.
+        provisioningUri:
+          type: string
+          format: uri
+          description: Present only when the account requires initial TOTP enrollment.
+        secret:
+          type: string
+          description: Base32 TOTP secret present only during initial enrollment.
+    VerifyTOTPRequest:
+      type: object
+      additionalProperties: false
+      required: [challengeToken, code]
+      properties:
+        challengeToken:
+          type: string
+          minLength: 1
+        code:
+          type: string
+          pattern: "^[0-9]{6}$"
+    AuthenticatedResponse:
+      type: object
+      additionalProperties: false
+      required: [status]
+      properties:
+        status:
+          type: string
+          const: authenticated
+    SessionResponse:
+      type: object
+      additionalProperties: false
+      required: [username]
+      properties:
+        username:
+          type: string
+    CreateUploadRequest:
+      type: object
+      required: [filename, size]
+      properties:
+        filename:
+          type: string
+          minLength: 1
+          maxLength: 255
+          description: Paths are reduced to their base filename by the server.
+          examples: [video.mp4]
+        mime_type:
+          type: string
+          maxLength: 255
+          description: Informational media type.
+          examples: [video/mp4]
+        size:
+          type: integer
+          format: int64
+          minimum: 1
+          description: Total media size in bytes; maximum is configured by the server.
+        sha256:
+          type: string
+          pattern: "^[0-9A-Fa-f]{64}$"
+          description: Optional SHA-256 used to verify the assembled file.
+    CreateUploadResponse:
+      type: object
+      additionalProperties: false
+      required: [id, chunk_size, chunks]
+      properties:
+        id:
+          type: string
+          pattern: "^[0-9a-f]{32}$"
+        chunk_size:
+          type: integer
+          format: int64
+          const: 8388608
+        chunks:
+          type: integer
+          format: int64
+          minimum: 1
+    UploadPartResponse:
+      type: object
+      additionalProperties: false
+      required: [upload_id, part, size]
+      properties:
+        upload_id:
+          type: string
+          pattern: "^[0-9a-f]{32}$"
+        part:
+          type: integer
+          format: int64
+          minimum: 0
+        size:
+          type: integer
+          format: int64
+          minimum: 1
+    UploadStatusResponse:
+      type: object
+      additionalProperties: false
+      required: [id, filename, size, chunks, uploaded_parts]
+      properties:
+        id:
+          type: string
+          pattern: "^[0-9a-f]{32}$"
+        filename:
+          type: string
+        size:
+          type: integer
+          format: int64
+          minimum: 1
+        chunks:
+          type: integer
+          format: int64
+          minimum: 1
+        uploaded_parts:
+          description: Uploaded zero-indexed parts; null when no parts exist yet.
+          type: [array, "null"]
+          items:
+            type: integer
+            format: int64
+            minimum: 0
+    CompleteUploadResponse:
+      type: object
+      additionalProperties: false
+      required: [status, media_path, size, sha256]
+      properties:
+        status:
+          type: string
+          const: completed
+        media_path:
+          type: string
+          description: Relative path formatted as YYYY/MM/{upload-id}_{filename}.
+        size:
+          type: integer
+          format: int64
+          minimum: 1
+        sha256:
+          type: string
+          pattern: "^[0-9a-f]{64}$"
+    DeleteUploadResponse:
+      type: object
+      additionalProperties: false
+      required: [status]
+      properties:
+        status:
+          type: string
+          const: deleted
+    ErrorResponse:
+      type: object
+      additionalProperties: false
+      required: [error]
+      properties:
+        error:
+          type: string
+  responses:
+    BadRequest:
+      description: Malformed JSON or unknown authentication request field.
+      content:
+        application/json:
+          schema:
+            $ref: "#/components/schemas/ErrorResponse"
+          examples:
+            malformed:
+              value:
+                error: Bad Request
+    UploadBadRequest:
+      description: Invalid upload metadata, part number, part size, final size, or checksum.
+      content:
+        application/json:
+          schema:
+            $ref: "#/components/schemas/ErrorResponse"
+          examples:
+            invalidPart:
+              value:
+                error: invalid part
+            checksumMismatch:
+              value:
+                error: SHA-256 mismatch
+    Unauthorized:
+      description: Missing or invalid session, credentials, challenge, or TOTP code.
+      content:
+        application/json:
+          schema:
+            $ref: "#/components/schemas/ErrorResponse"
+          examples:
+            unauthorized:
+              value:
+                error: Unauthorized
+    ForbiddenOrigin:
+      description: The Origin header is not in the configured CORS allowlist. Response has no body.
+    UploadNotFound:
+      description: Upload does not exist or is no longer active.
+      content:
+        application/json:
+          schema:
+            $ref: "#/components/schemas/ErrorResponse"
+          examples:
+            notFound:
+              value:
+                error: upload not found
+    MissingPart:
+      description: At least one expected upload part is missing.
+      content:
+        application/json:
+          schema:
+            $ref: "#/components/schemas/ErrorResponse"
+          examples:
+            missingPart:
+              value:
+                error: missing part 2
+    InternalServerError:
+      description: Unexpected filesystem, database, token generation, or encoding failure.
+      content:
+        application/json:
+          schema:
+            $ref: "#/components/schemas/ErrorResponse"
+          examples:
+            internal:
+              value:
+                error: internal server error

@@ -1,0 +1,7 @@
+.git
+.gitignore
+.vscode
+.env
+build
+vol
+**/*_test.go

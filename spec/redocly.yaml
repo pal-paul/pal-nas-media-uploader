@@ -1,0 +1,8 @@
+extends:
+  - recommended
+
+rules:
+  # This service currently has no declared software or API license.
+  info-license: off
+  # The checked-in server entry intentionally documents local Compose usage.
+  no-server-example.com: off

@@ -1,0 +1,44 @@
+services:
+  postgres:
+    image: ${POSTGRES_IMAGE}
+    environment:
+      POSTGRES_DB: ${POSTGRES_DB}
+      POSTGRES_USER: ${POSTGRES_USER}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD}
+    ports:
+      - "${POSTGRES_HOST_PORT}:${POSTGRES_CONTAINER_PORT}"
+    volumes:
+      - postgres_data:${POSTGRES_DATA_DIR}
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U $${POSTGRES_USER} -d $${POSTGRES_DB}"]
+      interval: ${POSTGRES_HEALTH_INTERVAL}
+      timeout: ${POSTGRES_HEALTH_TIMEOUT}
+      retries: ${POSTGRES_HEALTH_RETRIES}
+
+  uploader:
+    image: ${UPLOADER_IMAGE}
+    build:
+      context: ${BUILD_CONTEXT}
+      dockerfile: ${DOCKERFILE_PATH}
+      args:
+        GO_IMAGE: ${GO_IMAGE}
+        RUNTIME_IMAGE: ${RUNTIME_IMAGE}
+        ENV_MEDIA_DIR: ${ENV_MEDIA_DIR}
+        ENV_TMP_DIR: ${ENV_TMP_DIR}
+        ENV_PORT: ${ENV_PORT}
+    env_file:
+      - ../.env
+    ports:
+      - "${ENV_PORT}:${ENV_PORT}"
+    volumes:
+      - media_data:${ENV_MEDIA_DIR}
+      - upload_tmp:${ENV_TMP_DIR}
+    depends_on:
+      postgres:
+        condition: service_healthy
+    restart: ${COMPOSE_RESTART_POLICY}
+
+volumes:
+  postgres_data:
+  media_data:
+  upload_tmp:

@@ -1,0 +1,18 @@
+# Local environment and secrets
+.env
+.env.*
+!.env.example
+
+# Editor and operating system files
+.vscode/
+.DS_Store
+
+# Go build and test output
+/pal-nas-media-uploader
+*.test
+*.out
+coverage.*
+
+# Runtime media and temporary uploads
+vol/
+test/*.mp4
