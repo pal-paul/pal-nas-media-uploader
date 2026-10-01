@@ -15,6 +15,8 @@ import (
 	"sync"
 	"testing"
 
+	"pal-nas-media-uploader/app/auth"
+
 	"github.com/gin-gonic/gin"
 )
 
@@ -27,12 +29,17 @@ type completeResponse struct {
 }
 
 type recordingMediaRepository struct {
-	media []CompletedMedia
+	media       []CompletedMedia
+	storedBytes int64
 }
 
 func (repository *recordingMediaRepository) SaveCompletedMedia(_ context.Context, media CompletedMedia) error {
 	repository.media = append(repository.media, media)
 	return nil
+}
+
+func (repository *recordingMediaRepository) OwnerStorageBytes(context.Context, string) (int64, error) {
+	return repository.storedBytes, nil
 }
 
 func TestUploadSurvivesRestartAndCompletes(t *testing.T) {
@@ -108,6 +115,42 @@ func TestCreateUploadValidation(t *testing.T) {
 	}
 }
 
+func TestCreateUploadEnforcesPerUserQuotas(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+	tests := []struct {
+		name    string
+		options []Option
+	}{
+		{name: "active sessions", options: []Option{WithMaxActiveUploads(1)}},
+		{name: "pending bytes", options: []Option{WithMaxPendingUploadSize(6)}},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			root := t.TempDir()
+			service := newTestService(t, filepath.Join(root, "tmp"), filepath.Join(root, "media"), 4, test.options...)
+			router := newTestRouter(t, service)
+			createUpload(t, router, `{"filename":"first.mp4","size":4}`)
+			response := performRequest(router, http.MethodPost, "/media/upload", bytes.NewBufferString(`{"filename":"second.mp4","size":4}`))
+			if response.Code != http.StatusTooManyRequests {
+				t.Fatalf("got %d, want %d: %s", response.Code, http.StatusTooManyRequests, response.Body.String())
+			}
+		})
+	}
+}
+
+func TestCreateUploadEnforcesTotalStorageQuota(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+	root := t.TempDir()
+	repository := &recordingMediaRepository{storedBytes: 3}
+	service := newTestService(t, filepath.Join(root, "tmp"), filepath.Join(root, "media"), 4,
+		WithMediaRepository(repository), WithMaxUserStorageSize(6))
+	router := newTestRouter(t, service)
+	response := performRequest(router, http.MethodPost, "/media/upload", bytes.NewBufferString(`{"filename":"video.mp4","size":4}`))
+	if response.Code != http.StatusTooManyRequests {
+		t.Fatalf("got %d, want %d: %s", response.Code, http.StatusTooManyRequests, response.Body.String())
+	}
+}
+
 func TestConcurrentChunkReplacement(t *testing.T) {
 	gin.SetMode(gin.TestMode)
 	root := t.TempDir()
@@ -171,6 +214,26 @@ func TestCompleteUploadPersistsMedia(t *testing.T) {
 	if media.UploadID != created.ID || media.MediaPath == "" || media.SHA256 == "" {
 		t.Fatalf("incomplete media record: %#v", media)
 	}
+	if media.CreatedAt.IsZero() {
+		t.Fatal("expected media completion time to be persisted")
+	}
+}
+
+func TestUploadSessionIsPrivateToOwner(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+	root := t.TempDir()
+	service := newTestService(t, filepath.Join(root, "tmp"), filepath.Join(root, "media"), 4)
+	router := newTestRouter(t, service)
+	created := createUpload(t, router, `{"filename":"private.mp4","size":4}`)
+
+	request := httptest.NewRequest(http.MethodGet, "/media/upload/"+created.ID, nil)
+	request.Header.Set("X-Test-User", "22222222-2222-2222-2222-222222222222")
+	response := httptest.NewRecorder()
+	router.ServeHTTP(response, request)
+
+	if response.Code != http.StatusNotFound {
+		t.Fatalf("other user got status %d, want %d", response.Code, http.StatusNotFound)
+	}
 }
 
 func newTestService(t *testing.T, tmpDir string, mediaDir string, maxUploadSize int64, options ...Option) IUploaderService {
@@ -185,7 +248,16 @@ func newTestService(t *testing.T, tmpDir string, mediaDir string, maxUploadSize 
 
 func newTestRouter(t *testing.T, service IUploaderService) *gin.Engine {
 	t.Helper()
-	router, err := SetupRouter(gin.New(), service)
+	engine := gin.New()
+	engine.Use(func(context *gin.Context) {
+		userID := context.GetHeader("X-Test-User")
+		if userID == "" {
+			userID = "11111111-1111-1111-1111-111111111111"
+		}
+		context.Set(auth.UserContextKey, auth.User{ID: userID, Username: "test", Role: "user", UploadFolder: "test"})
+		context.Next()
+	})
+	router, err := SetupRouter(engine, service)
 	if err != nil {
 		t.Fatalf("setup router: %v", err)
 	}

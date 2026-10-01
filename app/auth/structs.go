@@ -7,6 +7,9 @@ type User struct {
 	Username     string
 	PasswordHash string
 	TOTPSecret   string
+	Role         string
+	UploadFolder string
+	TOTPRequired bool
 }
 
 type Challenge struct {
@@ -21,4 +24,6 @@ type LoginChallenge struct {
 	ChallengeToken  string `json:"challengeToken"`
 	ProvisioningURI string `json:"provisioningUri,omitempty"`
 	Secret          string `json:"secret,omitempty"`
+	Authenticated   bool   `json:"authenticated,omitempty"`
+	SessionToken    string `json:"-"`
 }

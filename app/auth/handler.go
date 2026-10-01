@@ -5,6 +5,7 @@ import (
 	"errors"
 	"io"
 	"log/slog"
+	"net"
 	"net/http"
 	"strings"
 	"time"
@@ -14,6 +15,7 @@ import (
 
 const sessionCookie = "pal_medias_uploader_session"
 const UsernameContextKey = "auth.username"
+const UserContextKey = "auth.user"
 
 func (handler *Service) Login(writer http.ResponseWriter, request *http.Request) {
 	var input struct {
@@ -24,10 +26,19 @@ func (handler *Service) Login(writer http.ResponseWriter, request *http.Request)
 		writeError(writer, http.StatusBadRequest, err)
 		return
 	}
+	if !handler.allowLogin(input.Username, clientAddress(request)) {
+		writeError(writer, http.StatusTooManyRequests, errors.New("too many authentication attempts"))
+		return
+	}
 	challenge, err := handler.BeginLogin(request.Context(), input.Username, input.Password)
 	if errors.Is(err, ErrInvalidCredentials) {
+		handler.recordFailedAttempt(handler.loginAttempts,
+			"account:"+strings.ToLower(strings.TrimSpace(input.Username)), "ip:"+clientAddress(request))
 		writeError(writer, http.StatusUnauthorized, err)
 		return
+	}
+	if err == nil && challenge.Authenticated {
+		http.SetCookie(writer, handler.authCookie(request, challenge.SessionToken, 30*24*60*60))
 	}
 	respond(writer, challenge, err)
 }
@@ -41,8 +52,14 @@ func (handler *Service) VerifyTOTP(writer http.ResponseWriter, request *http.Req
 		writeError(writer, http.StatusBadRequest, err)
 		return
 	}
+	if !handler.allowVerify(input.ChallengeToken, clientAddress(request)) {
+		writeError(writer, http.StatusTooManyRequests, errors.New("too many authentication attempts"))
+		return
+	}
 	token, err := handler.Verify(request.Context(), input.ChallengeToken, input.Code)
 	if errors.Is(err, ErrInvalidChallenge) || errors.Is(err, ErrInvalidCode) {
+		handler.recordFailedAttempt(handler.verifyAttempts,
+			"token:"+tokenHash(input.ChallengeToken), "ip:"+clientAddress(request))
 		writeError(writer, http.StatusUnauthorized, err)
 		return
 	}
@@ -60,12 +77,15 @@ func (handler *Service) Session(writer http.ResponseWriter, request *http.Reques
 		writeError(writer, http.StatusUnauthorized, ErrUnauthorized)
 		return
 	}
-	username, err := handler.Authenticate(request.Context(), cookie.Value)
+	user, err := handler.Authenticate(request.Context(), cookie.Value)
 	if err != nil {
 		writeError(writer, http.StatusUnauthorized, err)
 		return
 	}
-	writeJSON(writer, http.StatusOK, map[string]string{"username": username})
+	writeJSON(writer, http.StatusOK, map[string]any{
+		"id": user.ID, "username": user.Username, "role": user.Role,
+		"uploadFolder": user.UploadFolder, "totpEnabled": user.TOTPSecret != "",
+	})
 }
 
 func (handler *Service) LogoutHandler(writer http.ResponseWriter, request *http.Request) {
@@ -95,13 +115,14 @@ func (handler *Service) RequireAuth() gin.HandlerFunc {
 			context.Abort()
 			return
 		}
-		username, err := handler.Authenticate(context.Request.Context(), cookie.Value)
+		user, err := handler.Authenticate(context.Request.Context(), cookie.Value)
 		if err != nil {
 			writeError(context.Writer, http.StatusUnauthorized, ErrUnauthorized)
 			context.Abort()
 			return
 		}
-		context.Set(UsernameContextKey, username)
+		context.Set(UsernameContextKey, user.Username)
+		context.Set(UserContextKey, user)
 		context.Next()
 	}
 }
@@ -117,6 +138,14 @@ func decodeJSON(request *http.Request, target any) error {
 	decoder := json.NewDecoder(io.LimitReader(request.Body, 1<<20))
 	decoder.DisallowUnknownFields()
 	return decoder.Decode(target)
+}
+
+func clientAddress(request *http.Request) string {
+	host, _, err := net.SplitHostPort(request.RemoteAddr)
+	if err == nil {
+		return host
+	}
+	return request.RemoteAddr
 }
 
 func respond(writer http.ResponseWriter, value any, err error) {

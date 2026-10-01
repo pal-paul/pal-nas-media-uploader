@@ -19,7 +19,7 @@ ARG ENV_MEDIA_DIR
 ARG ENV_TMP_DIR
 ARG ENV_PORT
 
-RUN apk add --no-cache ca-certificates \
+RUN apk add --no-cache ca-certificates tzdata \
     && addgroup -S uploader \
     && adduser -S -G uploader uploader \
     && mkdir -p "${ENV_TMP_DIR}" "${ENV_MEDIA_DIR}" \

@@ -6,6 +6,7 @@ import (
 	"encoding/hex"
 	"fmt"
 	"io"
+	"math"
 	"net/http"
 	"os"
 	"path/filepath"
@@ -13,10 +14,17 @@ import (
 	"strings"
 	"time"
 
+	"pal-nas-media-uploader/app/auth"
+
 	"github.com/gin-gonic/gin"
 )
 
 func (s *service) HandleCreateUpload(context *gin.Context) {
+	identity, ok := uploadUser(context)
+	if !ok {
+		context.JSON(http.StatusForbidden, gin.H{"error": "uploads require a regular user with an upload folder"})
+		return
+	}
 	context.Request.Body = http.MaxBytesReader(context.Writer, context.Request.Body, maxCreateRequestSize)
 	var req CreateUploadRequest
 	if err := context.ShouldBindJSON(&req); err != nil {
@@ -53,13 +61,38 @@ func (s *service) HandleCreateUpload(context *gin.Context) {
 
 	chunks := (req.Size + chunkSize - 1) / chunkSize
 	u := &Upload{
-		ID:       id,
-		Filename: filename,
-		MimeType: req.MimeType,
-		Size:     req.Size,
-		SHA256:   checksum,
-		Chunks:   chunks,
-		Created:  time.Now().UTC(),
+		ID: id, OwnerID: identity.ID, UserFolder: identity.UploadFolder,
+		Filename: filename, MimeType: req.MimeType, Size: req.Size,
+		SHA256: checksum, Chunks: chunks, Created: time.Now().UTC(),
+	}
+	s.uploadMux.Lock()
+	defer s.uploadMux.Unlock()
+	stored := int64(0)
+	if s.mediaStore != nil {
+		stored, err = s.mediaStore.OwnerStorageBytes(context.Request.Context(), identity.ID)
+		if err != nil {
+			internalError(context, fmt.Errorf("read owner storage usage: %w", err))
+			return
+		}
+	}
+	active, pending := 0, int64(0)
+	for _, existing := range s.uploads {
+		if existing.upload.OwnerID == identity.ID && !existing.deleted {
+			active++
+			if pending > math.MaxInt64-existing.upload.Size {
+				pending = math.MaxInt64
+			} else {
+				pending += existing.upload.Size
+			}
+		}
+	}
+	storageExceeded := quotaExceeded(stored, pending, s.maxStorageSize)
+	if !storageExceeded {
+		storageExceeded = quotaExceeded(stored+pending, u.Size, s.maxStorageSize)
+	}
+	if active >= s.maxActive || quotaExceeded(pending, u.Size, s.maxPendingSize) || storageExceeded {
+		context.JSON(http.StatusTooManyRequests, gin.H{"error": "upload quota exceeded"})
+		return
 	}
 	dir := filepath.Join(s.tmpDir, id)
 	if err := os.Mkdir(dir, 0750); err != nil {
@@ -71,14 +104,12 @@ func (s *service) HandleCreateUpload(context *gin.Context) {
 		internalError(context, fmt.Errorf("write upload metadata: %w", err))
 		return
 	}
-	s.uploadMux.Lock()
 	s.uploads[id] = &uploadSession{upload: *u}
-	s.uploadMux.Unlock()
 	context.JSON(http.StatusCreated, gin.H{"id": id, "chunk_size": chunkSize, "chunks": chunks})
 }
 
 func (s *service) HandleUploadPart(context *gin.Context) {
-	session, ok := s.getSession(context.Param("id"))
+	session, ok := s.getOwnedSession(context, context.Param("id"))
 	if !ok {
 		context.JSON(http.StatusNotFound, gin.H{"error": "upload not found"})
 		return
@@ -130,7 +161,7 @@ func (s *service) HandleUploadPart(context *gin.Context) {
 	context.JSON(http.StatusOK, gin.H{"upload_id": u.ID, "part": part, "size": n})
 }
 func (s *service) HandleCompleteUpload(context *gin.Context) {
-	session, ok := s.getSession(context.Param("id"))
+	session, ok := s.getOwnedSession(context, context.Param("id"))
 	if !ok {
 		context.JSON(http.StatusNotFound, gin.H{"error": "upload not found"})
 		return
@@ -143,11 +174,19 @@ func (s *service) HandleCompleteUpload(context *gin.Context) {
 	}
 	u := &session.upload
 	dir := filepath.Join(s.tmpDir, u.ID)
-	if u.MediaPath == "" {
+	if u.MediaPath == "" || u.Completed.IsZero() {
+		previousMediaPath := u.MediaPath
+		previousCompleted := u.Completed
 		now := time.Now().UTC()
-		u.MediaPath = filepath.Join(now.Format("2006"), now.Format("01"), u.ID+"_"+u.Filename)
+		if u.MediaPath == "" {
+			u.MediaPath = filepath.Join(u.UserFolder, now.Format("2006"), now.Format("01"), u.ID+"_"+u.Filename)
+		}
+		if u.Completed.IsZero() {
+			u.Completed = now
+		}
 		if err := s.writeMetadata(u); err != nil {
-			u.MediaPath = ""
+			u.MediaPath = previousMediaPath
+			u.Completed = previousCompleted
 			internalError(context, fmt.Errorf("persist media path: %w", err))
 			return
 		}
@@ -216,12 +255,13 @@ func (s *service) HandleCompleteUpload(context *gin.Context) {
 	if s.mediaStore != nil {
 		media := CompletedMedia{
 			UploadID:  u.ID,
+			OwnerID:   u.OwnerID,
 			Filename:  u.Filename,
 			MimeType:  u.MimeType,
 			Size:      total,
 			SHA256:    sum,
 			MediaPath: filepath.ToSlash(u.MediaPath),
-			CreatedAt: u.Created,
+			CreatedAt: u.Completed,
 		}
 		if err := s.mediaStore.SaveCompletedMedia(context.Request.Context(), media); err != nil {
 			internalError(context, fmt.Errorf("save completed media: %w", err))
@@ -241,7 +281,7 @@ func (s *service) HandleCompleteUpload(context *gin.Context) {
 }
 
 func (s *service) HandleGetUploadStatus(context *gin.Context) {
-	session, ok := s.getSession(context.Param("id"))
+	session, ok := s.getOwnedSession(context, context.Param("id"))
 	if !ok {
 		context.JSON(http.StatusNotFound, gin.H{"error": "upload not found"})
 		return
@@ -263,7 +303,7 @@ func (s *service) HandleGetUploadStatus(context *gin.Context) {
 }
 func (s *service) HandleDeleteUpload(context *gin.Context) {
 	id := context.Param("id")
-	session, ok := s.getSession(id)
+	session, ok := s.getOwnedSession(context, id)
 	if !ok {
 		context.JSON(http.StatusNotFound, gin.H{"error": "upload not found"})
 		return
@@ -287,6 +327,10 @@ func (s *service) HandleDeleteUpload(context *gin.Context) {
 	context.JSON(http.StatusOK, gin.H{"status": "deleted"})
 }
 
+func quotaExceeded(used, requested, limit int64) bool {
+	return used > limit || requested > limit-used
+}
+
 func generateUniqueID() (string, error) {
 	b := make([]byte, 16)
 	if _, err := rand.Read(b); err != nil {
@@ -300,6 +344,24 @@ func (s *service) getSession(id string) (*uploadSession, bool) {
 	defer s.uploadMux.RUnlock()
 	session, ok := s.uploads[id]
 	return session, ok
+}
+
+func (s *service) getOwnedSession(context *gin.Context, id string) (*uploadSession, bool) {
+	identity, ok := uploadUser(context)
+	if !ok {
+		return nil, false
+	}
+	session, ok := s.getSession(id)
+	if !ok || session.upload.OwnerID != identity.ID {
+		return nil, false
+	}
+	return session, true
+}
+
+func uploadUser(context *gin.Context) (auth.User, bool) {
+	value, exists := context.Get(auth.UserContextKey)
+	identity, ok := value.(auth.User)
+	return identity, exists && ok && identity.Role == "user" && identity.UploadFolder != ""
 }
 
 func sanitizeFilename(filename string) (string, error) {

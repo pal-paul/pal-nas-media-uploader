@@ -9,9 +9,9 @@ import (
 	"errors"
 	"fmt"
 	"strings"
+	"sync"
 	"time"
 
-	"github.com/google/uuid"
 	"github.com/pquerna/otp"
 	"github.com/pquerna/otp/totp"
 	"golang.org/x/crypto/bcrypt"
@@ -22,51 +22,106 @@ var ErrInvalidChallenge = errors.New("invalid or expired authentication challeng
 var ErrInvalidCode = errors.New("invalid authentication code")
 var ErrUnauthorized = errors.New("authentication required")
 
+const (
+	loginAccountAttempts = 5
+	loginIPAttempts      = 20
+	verifyTokenAttempts  = 6
+	verifyIPAttempts     = 30
+	attemptWindow        = 5 * time.Minute
+)
+
 type Database interface {
-	AuthUserCount(context.Context) (int, error)
-	CreateAuthUser(context.Context, User) error
 	GetAuthUserByUsername(context.Context, string) (User, error)
 	CreateAuthChallenge(context.Context, string, string, string, time.Time) error
 	GetAuthChallenge(context.Context, string) (Challenge, error)
-	DeleteAuthChallenge(context.Context, string) error
+	DeleteAuthChallenge(context.Context, string) (bool, error)
 	EnableTOTP(context.Context, string, string) error
 	CreateAuthSession(context.Context, string, string, time.Time) error
-	GetAuthSessionUsername(context.Context, string, time.Time) (string, error)
+	GetAuthSessionUser(context.Context, string, time.Time) (User, error)
 	DeleteAuthSession(context.Context, string) error
 }
 
 type Service struct {
-	database Database
-	issuer   string
+	database           Database
+	issuer             string
+	attemptsMutex      sync.Mutex
+	loginAttempts      map[string]attemptState
+	verifyAttempts     map[string]attemptState
+	lastAttemptCleanup time.Time
+}
+
+type attemptState struct {
+	count       int
+	windowStart time.Time
 }
 
 func NewService(
 	repository Database,
 	issuer string,
 ) *Service {
-	return &Service{database: repository, issuer: issuer}
+	return &Service{
+		database: repository, issuer: issuer,
+		loginAttempts: make(map[string]attemptState), verifyAttempts: make(map[string]attemptState),
+	}
 }
 
-func (service *Service) EnsureAdmin(ctx context.Context, username, password string) error {
-	count, err := service.database.AuthUserCount(ctx)
-	if err != nil || count > 0 {
-		return err
+func (service *Service) allowLogin(username, address string) bool {
+	return service.attemptAllowed(service.loginAttempts, "account:"+strings.ToLower(strings.TrimSpace(username)), loginAccountAttempts) &&
+		service.attemptAllowed(service.loginAttempts, "ip:"+address, loginIPAttempts)
+}
+
+func (service *Service) allowVerify(challengeToken, address string) bool {
+	return service.attemptAllowed(service.verifyAttempts, "token:"+tokenHash(challengeToken), verifyTokenAttempts) &&
+		service.attemptAllowed(service.verifyAttempts, "ip:"+address, verifyIPAttempts)
+}
+
+func (service *Service) attemptAllowed(attempts map[string]attemptState, key string, limit int) bool {
+	service.attemptsMutex.Lock()
+	defer service.attemptsMutex.Unlock()
+	now := time.Now()
+	state := attempts[key]
+	if state.windowStart.IsZero() || now.Sub(state.windowStart) >= attemptWindow {
+		delete(attempts, key)
+		return true
 	}
-	username = strings.TrimSpace(username)
-	if username == "" || len(password) < 12 {
-		return errors.New("ENV_ADMIN_USERNAME and ENV_ADMIN_PASSWORD (at least 12 characters) are required for first startup")
+	return state.count < limit
+}
+
+func (service *Service) recordFailedAttempt(attempts map[string]attemptState, keys ...string) {
+	service.attemptsMutex.Lock()
+	defer service.attemptsMutex.Unlock()
+	now := time.Now()
+	if service.lastAttemptCleanup.IsZero() || now.Sub(service.lastAttemptCleanup) >= attemptWindow {
+		for _, tracked := range []map[string]attemptState{service.loginAttempts, service.verifyAttempts} {
+			for key, state := range tracked {
+				if now.Sub(state.windowStart) >= attemptWindow {
+					delete(tracked, key)
+				}
+			}
+		}
+		service.lastAttemptCleanup = now
 	}
-	hash, err := bcrypt.GenerateFromPassword([]byte(password), bcrypt.DefaultCost)
-	if err != nil {
-		return fmt.Errorf("hash admin password: %w", err)
+	for _, key := range keys {
+		state := attempts[key]
+		if state.windowStart.IsZero() || now.Sub(state.windowStart) >= attemptWindow {
+			state = attemptState{windowStart: now}
+		}
+		state.count++
+		attempts[key] = state
 	}
-	return service.database.CreateAuthUser(ctx, User{ID: uuid.NewString(), Username: username, PasswordHash: string(hash)})
 }
 
 func (service *Service) BeginLogin(ctx context.Context, username, password string) (LoginChallenge, error) {
 	user, err := service.database.GetAuthUserByUsername(ctx, strings.TrimSpace(username))
 	if err != nil || bcrypt.CompareHashAndPassword([]byte(user.PasswordHash), []byte(password)) != nil {
 		return LoginChallenge{}, ErrInvalidCredentials
+	}
+	if !user.TOTPRequired {
+		sessionToken, err := service.createSession(ctx, user.ID)
+		if err != nil {
+			return LoginChallenge{}, err
+		}
+		return LoginChallenge{Authenticated: true, SessionToken: sessionToken}, nil
 	}
 	pendingSecret := ""
 	result := LoginChallenge{}
@@ -111,28 +166,36 @@ func (service *Service) Verify(ctx context.Context, challengeToken, code string)
 			return "", err
 		}
 	}
-	if err := service.database.DeleteAuthChallenge(ctx, hash); err != nil {
+	deleted, err := service.database.DeleteAuthChallenge(ctx, hash)
+	if err != nil {
 		return "", err
 	}
+	if !deleted {
+		return "", ErrInvalidChallenge
+	}
+	return service.createSession(ctx, challenge.UserID)
+}
+
+func (service *Service) Authenticate(ctx context.Context, sessionToken string) (User, error) {
+	if sessionToken == "" {
+		return User{}, ErrUnauthorized
+	}
+	user, err := service.database.GetAuthSessionUser(ctx, tokenHash(sessionToken), time.Now())
+	if err != nil {
+		return User{}, ErrUnauthorized
+	}
+	return user, nil
+}
+
+func (service *Service) createSession(ctx context.Context, userID string) (string, error) {
 	sessionToken, err := randomToken()
 	if err != nil {
 		return "", err
 	}
-	if err := service.database.CreateAuthSession(ctx, tokenHash(sessionToken), challenge.UserID, time.Now().Add(30*24*time.Hour)); err != nil {
+	if err := service.database.CreateAuthSession(ctx, tokenHash(sessionToken), userID, time.Now().Add(30*24*time.Hour)); err != nil {
 		return "", err
 	}
 	return sessionToken, nil
-}
-
-func (service *Service) Authenticate(ctx context.Context, sessionToken string) (string, error) {
-	if sessionToken == "" {
-		return "", ErrUnauthorized
-	}
-	username, err := service.database.GetAuthSessionUsername(ctx, tokenHash(sessionToken), time.Now())
-	if err != nil {
-		return "", ErrUnauthorized
-	}
-	return username, nil
 }
 
 func (service *Service) Logout(ctx context.Context, sessionToken string) error {

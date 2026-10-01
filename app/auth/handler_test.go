@@ -1,12 +1,30 @@
 package auth
 
 import (
+	"bytes"
 	"net/http"
 	"net/http/httptest"
 	"testing"
 
 	"github.com/gin-gonic/gin"
 )
+
+func TestLoginRateLimit(t *testing.T) {
+	service := NewService(&memoryRepository{}, "PAL Gallery Test")
+	for attempt := 1; attempt <= loginAccountAttempts+1; attempt++ {
+		request := httptest.NewRequest(http.MethodPost, "/auth/login", bytes.NewBufferString(`{"username":"admin","password":"wrong"}`))
+		request.RemoteAddr = "192.0.2.1:1234"
+		response := httptest.NewRecorder()
+		service.Login(response, request)
+		want := http.StatusUnauthorized
+		if attempt > loginAccountAttempts {
+			want = http.StatusTooManyRequests
+		}
+		if response.Code != want {
+			t.Fatalf("attempt %d: got status %d, want %d", attempt, response.Code, want)
+		}
+	}
+}
 
 func TestSessionRejectsMissingCookie(t *testing.T) {
 	service := NewService(&memoryRepository{}, "PAL Gallery Test")

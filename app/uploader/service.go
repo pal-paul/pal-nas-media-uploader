@@ -11,12 +11,15 @@ import (
 )
 
 type service struct {
-	tmpDir        string
-	mediaDir      string
-	maxUploadSize int64
-	mediaStore    MediaRepository
-	uploads       map[string]*uploadSession
-	uploadMux     sync.RWMutex
+	tmpDir         string
+	mediaDir       string
+	maxUploadSize  int64
+	maxPendingSize int64
+	maxStorageSize int64
+	maxActive      int
+	mediaStore     MediaRepository
+	uploads        map[string]*uploadSession
+	uploadMux      sync.RWMutex
 }
 
 type IUploaderService interface {
@@ -39,6 +42,36 @@ func WithMaxUploadSize(size int64) Option {
 	}
 }
 
+func WithMaxPendingUploadSize(size int64) Option {
+	return func(service *service) error {
+		if size <= 0 {
+			return fmt.Errorf("maximum pending upload size must be positive")
+		}
+		service.maxPendingSize = size
+		return nil
+	}
+}
+
+func WithMaxUserStorageSize(size int64) Option {
+	return func(service *service) error {
+		if size <= 0 {
+			return fmt.Errorf("maximum user storage size must be positive")
+		}
+		service.maxStorageSize = size
+		return nil
+	}
+}
+
+func WithMaxActiveUploads(count int) Option {
+	return func(service *service) error {
+		if count <= 0 {
+			return fmt.Errorf("maximum active uploads must be positive")
+		}
+		service.maxActive = count
+		return nil
+	}
+}
+
 func WithMediaRepository(repository MediaRepository) Option {
 	return func(service *service) error {
 		if repository == nil {
@@ -55,10 +88,13 @@ func New(tmpDir string, mediaDir string, options ...Option) (IUploaderService, e
 	}
 
 	service := &service{
-		tmpDir:        filepath.Clean(tmpDir),
-		mediaDir:      filepath.Clean(mediaDir),
-		maxUploadSize: defaultMaxUploadSize,
-		uploads:       make(map[string]*uploadSession),
+		tmpDir:         filepath.Clean(tmpDir),
+		mediaDir:       filepath.Clean(mediaDir),
+		maxUploadSize:  defaultMaxUploadSize,
+		maxPendingSize: defaultMaxPendingSize,
+		maxStorageSize: defaultMaxStorageSize,
+		maxActive:      defaultMaxActive,
+		uploads:        make(map[string]*uploadSession),
 	}
 	for _, option := range options {
 		if err := option(service); err != nil {
