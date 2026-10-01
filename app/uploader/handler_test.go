@@ -6,14 +6,17 @@ import (
 	"crypto/sha256"
 	"encoding/hex"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"net/http"
 	"net/http/httptest"
 	"os"
 	"path/filepath"
+	"strings"
 	"sync"
 	"testing"
+	"time"
 
 	"pal-nas-media-uploader/app/auth"
 
@@ -30,16 +33,61 @@ type completeResponse struct {
 
 type recordingMediaRepository struct {
 	media       []CompletedMedia
+	duplicate   *CompletedMedia
 	storedBytes int64
+	saveErr     error
+	quota       *int64
 }
 
 func (repository *recordingMediaRepository) SaveCompletedMedia(_ context.Context, media CompletedMedia) error {
+	if repository.saveErr != nil {
+		return repository.saveErr
+	}
 	repository.media = append(repository.media, media)
 	return nil
 }
 
 func (repository *recordingMediaRepository) OwnerStorageBytes(context.Context, string) (int64, error) {
 	return repository.storedBytes, nil
+}
+
+func (repository *recordingMediaRepository) OwnerStorageQuota(context.Context, string) (int64, bool, error) {
+	if repository.quota == nil {
+		return 0, false, nil
+	}
+	return *repository.quota, true, nil
+}
+
+func (repository *recordingMediaRepository) FindOwnedMediaBySHA256(_ context.Context, ownerID, checksum string) (CompletedMedia, bool, error) {
+	if repository.duplicate == nil || repository.duplicate.OwnerID != ownerID || repository.duplicate.SHA256 != checksum {
+		return CompletedMedia{}, false, nil
+	}
+	return *repository.duplicate, true, nil
+}
+func (repository *recordingMediaRepository) ValidateUploadBatch(context.Context, string, string) error {
+	return nil
+}
+
+func TestCheckDuplicateAndCreateConflict(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+	checksum := strings.Repeat("a", 64)
+	existing := CompletedMedia{
+		UploadID: "existing-upload", OwnerID: "11111111-1111-1111-1111-111111111111",
+		Filename: "existing.mp4", Size: 42, SHA256: checksum, CreatedAt: time.Now(),
+	}
+	root := t.TempDir()
+	repository := &recordingMediaRepository{duplicate: &existing}
+	service := newTestService(t, filepath.Join(root, "tmp"), filepath.Join(root, "media"), 100, WithMediaRepository(repository))
+	router := newTestRouter(t, service)
+
+	response := performRequest(router, http.MethodPost, "/media/upload/check", bytes.NewBufferString(`{"sha256":"`+checksum+`"}`))
+	if response.Code != http.StatusOK || !strings.Contains(response.Body.String(), `"duplicate":true`) {
+		t.Fatalf("duplicate check returned %d: %s", response.Code, response.Body.String())
+	}
+	response = performRequest(router, http.MethodPost, "/media/upload", bytes.NewBufferString(`{"filename":"copy.mp4","size":42,"sha256":"`+checksum+`"}`))
+	if response.Code != http.StatusConflict {
+		t.Fatalf("create returned %d, want %d: %s", response.Code, http.StatusConflict, response.Body.String())
+	}
 }
 
 func TestUploadSurvivesRestartAndCompletes(t *testing.T) {
@@ -151,6 +199,19 @@ func TestCreateUploadEnforcesTotalStorageQuota(t *testing.T) {
 	}
 }
 
+func TestUploadPartRejectsLowDiskSpace(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+	root := t.TempDir()
+	service := newTestService(t, filepath.Join(root, "tmp"), filepath.Join(root, "media"), 4,
+		WithMinDiskFree(10), withDiskFree(func(string) (int64, error) { return 10, nil }))
+	router := newTestRouter(t, service)
+	created := createUpload(t, router, `{"filename":"video.mp4","size":4}`)
+	response := performRequest(router, http.MethodPut, "/media/upload/"+created.ID+"/parts/0", bytes.NewBufferString("data"))
+	if response.Code != http.StatusServiceUnavailable {
+		t.Fatalf("got %d, want %d: %s", response.Code, http.StatusServiceUnavailable, response.Body.String())
+	}
+}
+
 func TestConcurrentChunkReplacement(t *testing.T) {
 	gin.SetMode(gin.TestMode)
 	root := t.TempDir()
@@ -219,6 +280,36 @@ func TestCompleteUploadPersistsMedia(t *testing.T) {
 	}
 }
 
+func TestCompleteUploadRemovesFileWhenPersistenceFails(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+	root := t.TempDir()
+	tmpDir := filepath.Join(root, "tmp")
+	mediaDir := filepath.Join(root, "media")
+	repository := &recordingMediaRepository{saveErr: errors.New("database unavailable")}
+	service := newTestService(t, tmpDir, mediaDir, 4, WithMediaRepository(repository), WithMinDiskFree(0))
+	router := newTestRouter(t, service)
+	created := createUpload(t, router, `{"filename":"video.mp4","size":4}`)
+	if response := performRequest(router, http.MethodPut, "/media/upload/"+created.ID+"/parts/0", bytes.NewBufferString("data")); response.Code != http.StatusOK {
+		t.Fatalf("upload part returned %d: %s", response.Code, response.Body.String())
+	}
+	response := performRequest(router, http.MethodPost, "/media/upload/"+created.ID+"/complete", nil)
+	if response.Code != http.StatusInternalServerError {
+		t.Fatalf("got %d, want %d: %s", response.Code, http.StatusInternalServerError, response.Body.String())
+	}
+	if _, err := os.Stat(filepath.Join(tmpDir, created.ID, "00000000.part")); err != nil {
+		t.Fatalf("resumable chunk was not retained: %v", err)
+	}
+	err := filepath.WalkDir(mediaDir, func(path string, entry os.DirEntry, walkErr error) error {
+		if walkErr == nil && entry.Type().IsRegular() {
+			t.Errorf("uncommitted media file remains at %s", path)
+		}
+		return walkErr
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+}
+
 func TestUploadSessionIsPrivateToOwner(t *testing.T) {
 	gin.SetMode(gin.TestMode)
 	root := t.TempDir()
@@ -233,6 +324,25 @@ func TestUploadSessionIsPrivateToOwner(t *testing.T) {
 
 	if response.Code != http.StatusNotFound {
 		t.Fatalf("other user got status %d, want %d", response.Code, http.StatusNotFound)
+	}
+}
+
+func TestCleanupExpiredUploadsRemovesSession(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+	root := t.TempDir()
+	service := newTestService(t, filepath.Join(root, "tmp"), filepath.Join(root, "media"), 4)
+	router := newTestRouter(t, service)
+	created := createUpload(t, router, `{"filename":"old.mp4","size":4}`)
+	removed, err := service.CleanupExpiredUploads(time.Now().Add(2*time.Hour), time.Hour)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if removed != 1 {
+		t.Fatalf("removed %d uploads, want 1", removed)
+	}
+	response := performRequest(router, http.MethodGet, "/media/upload/"+created.ID, nil)
+	if response.Code != http.StatusNotFound {
+		t.Fatalf("got %d, want %d", response.Code, http.StatusNotFound)
 	}
 }
 

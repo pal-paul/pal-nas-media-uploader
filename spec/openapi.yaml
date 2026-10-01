@@ -16,8 +16,8 @@ info:
     The first persistent administrator is created through the one-time HTML
     setup flow. Deployment bootstrap credentials authorize that operation only
     and are never stored as an application account. The initial administrator
-    uses password-only login. Every account subsequently created by an
-    administrator uses password plus TOTP.
+    enrolls TOTP on first login. Every account subsequently created by an
+    administrator also uses password plus TOTP.
 
     ## Sessions and browser access
 
@@ -33,7 +33,7 @@ info:
     Upload sessions belong to the user who created them. Parts are zero-indexed
     and use a fixed 8 MiB size except for the final part. Active upload metadata
     and parts are persisted under the temporary directory and are reloaded after
-    a process restart. Uploads do not expire automatically. Completion assembles
+    a process restart. Abandoned uploads expire after the configured retention period. Completion assembles
     parts in order, computes SHA-256, optionally verifies the client checksum,
     atomically moves the file into media storage, and persists the media record.
 
@@ -94,9 +94,68 @@ tags:
     description: Owned and shared completed media, downloads, and owner-managed sharing.
   - name: Gallery
     description: User-owned albums, personal favorites, trash, and accessible storage totals.
+  - name: Operations
+    description: Container health, readiness, and administrator integrity checks.
+  - name: Processing
+    description: Durable thumbnail and metadata processing jobs.
+  - name: Public Sharing
+    description: Expiring, optionally password-protected media and album links.
+  - name: Transfer
+    description: Versioned album and media metadata import and export.
 security:
   - sessionCookie: []
 paths:
+  /healthz:
+    get:
+      tags: [Operations]
+      operationId: liveness
+      summary: Check process liveness
+      security: []
+      responses:
+        "200":
+          description: The HTTP process is running.
+        "403":
+          description: The request supplied an Origin outside the configured allowlist.
+  /readyz:
+    get:
+      tags: [Operations]
+      operationId: readiness
+      summary: Check database and storage readiness
+      security: []
+      responses:
+        "200":
+          description: Database and both storage roots are ready.
+        "403":
+          description: The request supplied an Origin outside the configured allowlist.
+        "503":
+          description: Database connectivity or filesystem reserve check failed.
+  /admin/operations/integrity:
+    get:
+      tags: [Operations]
+      operationId: scanIntegrity
+      summary: Compare media records with filesystem files
+      responses:
+        "200":
+          description: Integrity report.
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [filesWithoutRecords, recordsWithoutFiles, checkedAt]
+                properties:
+                  filesWithoutRecords:
+                    type: array
+                    items: { type: string }
+                  recordsWithoutFiles:
+                    type: array
+                    items: { type: string }
+                  checkedAt:
+                    type: string
+                    format: date-time
+        "403":
+          description: Administrator role required.
+        "500":
+          description: Integrity scan failed.
   /setup:
     get:
       tags: [Setup]
@@ -130,8 +189,8 @@ paths:
         Creation is serialized in PostgreSQL and succeeds only while no users
         exist, preventing concurrent requests from creating multiple initial
         administrators. The selected password is bcrypt-hashed. The resulting
-        account has role `admin`, an empty upload folder, and does not require
-        TOTP. Usernames are trimmed and remain case-sensitive.
+        account has role `admin`, an empty upload folder, and enrolls TOTP on
+        first login. Usernames are trimmed and remain case-sensitive.
       security: []
       requestBody:
         required: true
@@ -234,6 +293,8 @@ paths:
           $ref: "#/components/responses/Unauthorized"
         "403":
           $ref: "#/components/responses/ForbiddenOrigin"
+        "409":
+          $ref: "#/components/responses/UploadConflict"
         "500":
           $ref: "#/components/responses/InternalServerError"
   /auth/verify:
@@ -632,6 +693,26 @@ paths:
           schema:
             type: boolean
             default: false
+        - name: capturedAfter
+          in: query
+          description: Include media captured at or after this timestamp.
+          schema: { type: string, format: date-time }
+        - name: capturedBefore
+          in: query
+          description: Include media captured at or before this timestamp.
+          schema: { type: string, format: date-time }
+        - name: latitude
+          in: query
+          description: Center latitude for a radius search. Used only with longitude and radiusKm.
+          schema: { type: number, format: double, minimum: -90, maximum: 90 }
+        - name: longitude
+          in: query
+          description: Center longitude for a radius search. Used only with latitude and radiusKm.
+          schema: { type: number, format: double, minimum: -180, maximum: 180 }
+        - name: radiusKm
+          in: query
+          description: Maximum great-circle distance in kilometers.
+          schema: { type: number, format: double, exclusiveMinimum: 0 }
       responses:
         "200":
           description: Accessible completed media.
@@ -965,9 +1046,423 @@ paths:
         "404":
           $ref: "#/components/responses/UploadNotFound"
         "409":
-          $ref: "#/components/responses/MissingPart"
+          $ref: "#/components/responses/UploadConflict"
         "500":
           $ref: "#/components/responses/InternalServerError"
+  /auth/recovery:
+    post:
+      tags: [Authentication]
+      operationId: verifyRecoveryCode
+      summary: Authenticate with a single-use TOTP recovery code
+      description: Requires the short-lived challenge returned after successful password verification. Three invalid attempts are rate limited with the same controls as TOTP verification.
+      security: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/RecoveryVerificationRequest"
+      responses:
+        "200":
+          description: Recovery code consumed and authenticated session created.
+          headers:
+            Set-Cookie:
+              schema: { type: string }
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/AuthenticatedResponse"
+        "400":
+          $ref: "#/components/responses/BadRequest"
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+        "429":
+          description: Too many authentication attempts.
+        "500":
+          $ref: "#/components/responses/InternalServerError"
+  /auth/recovery-codes:
+    post:
+      tags: [Authentication]
+      operationId: regenerateRecoveryCodes
+      summary: Replace and return TOTP recovery codes
+      description: Invalidates every previous code and returns ten new single-use codes. Only hashes are retained; this response is the only opportunity to save the plaintext values.
+      responses:
+        "201":
+          description: New recovery-code set.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/RecoveryCodesResponse"
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+        "500":
+          $ref: "#/components/responses/InternalServerError"
+  /admin/users/{id}/password:
+    patch:
+      tags: [Users]
+      operationId: resetUserPassword
+      summary: Reset a user's password and revoke their sessions
+      parameters:
+        - $ref: "#/components/parameters/UserID"
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/PasswordResetRequest"
+      responses:
+        "204":
+          description: Password replaced and all target-user sessions deleted.
+        "400":
+          $ref: "#/components/responses/BadRequest"
+        "403":
+          $ref: "#/components/responses/Forbidden"
+  /admin/users/{id}/quota:
+    patch:
+      tags: [Users]
+      operationId: setUserStorageQuota
+      summary: Set or clear a per-user storage quota
+      parameters:
+        - $ref: "#/components/parameters/UserID"
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/QuotaRequest"
+      responses:
+        "204":
+          description: Quota updated. A null value restores the environment default.
+        "400":
+          $ref: "#/components/responses/BadRequest"
+        "403":
+          $ref: "#/components/responses/Forbidden"
+  /admin/users/{id}/trash-retention:
+    patch:
+      tags: [Users]
+      operationId: setUserTrashRetention
+      summary: Set a user's trash retention period
+      parameters:
+        - $ref: "#/components/parameters/UserID"
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/TrashRetentionRequest"
+      responses:
+        "204":
+          description: Retention period updated.
+        "400":
+          $ref: "#/components/responses/BadRequest"
+        "403":
+          $ref: "#/components/responses/Forbidden"
+  /admin/storage/dashboard:
+    get:
+      tags: [Users]
+      operationId: getStorageDashboard
+      summary: Get aggregate and per-user storage usage
+      responses:
+        "200":
+          description: Storage dashboard.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/StorageDashboard"
+        "403":
+          $ref: "#/components/responses/Forbidden"
+  /admin/processing-jobs:
+    get:
+      tags: [Processing]
+      operationId: listProcessingJobs
+      summary: List the 200 most recently updated media-processing jobs
+      responses:
+        "200":
+          description: Processing jobs ordered by most recent update.
+          content:
+            application/json:
+              schema:
+                type: array
+                items:
+                  $ref: "#/components/schemas/ProcessingJob"
+        "403":
+          $ref: "#/components/responses/Forbidden"
+        "500":
+          $ref: "#/components/responses/InternalServerError"
+  /admin/processing-jobs/{id}/retry:
+    post:
+      tags: [Processing]
+      operationId: retryProcessingJob
+      summary: Retry a failed processing job
+      parameters:
+        - $ref: "#/components/parameters/JobID"
+      responses:
+        "204":
+          description: Job reset to queued with its attempt count cleared.
+        "403":
+          $ref: "#/components/responses/Forbidden"
+        "404":
+          $ref: "#/components/responses/ResourceNotFound"
+  /admin/trash/cleanup:
+    post:
+      tags: [Operations]
+      operationId: cleanupExpiredTrash
+      summary: Permanently remove expired trash immediately
+      responses:
+        "200":
+          description: Cleanup result for up to 500 records.
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [removed]
+                properties:
+                  removed: { type: integer, minimum: 0 }
+        "403":
+          $ref: "#/components/responses/Forbidden"
+        "500":
+          $ref: "#/components/responses/InternalServerError"
+  /media/app:
+    get:
+      tags: [Media]
+      operationId: mediaWorkspacePage
+      summary: Open the embedded media workspace
+      responses:
+        "200":
+          description: Authenticated media workspace HTML.
+          content:
+            text/html:
+              schema: { type: string }
+        "403":
+          $ref: "#/components/responses/Forbidden"
+        "404":
+          description: Frontend pages are disabled.
+  /media/upload/check:
+    post:
+      tags: [Uploads]
+      operationId: checkDuplicateMedia
+      summary: Check an owner-scoped SHA-256 digest
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/DuplicateCheckRequest"
+      responses:
+        "200":
+          description: Duplicate lookup result.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/DuplicateCheckResponse"
+        "400":
+          $ref: "#/components/responses/BadRequest"
+        "403":
+          $ref: "#/components/responses/Forbidden"
+        "500":
+          $ref: "#/components/responses/InternalServerError"
+  /media/files/{id}/thumbnail:
+    get:
+      tags: [Media]
+      operationId: downloadThumbnail
+      summary: Get a generated thumbnail for accessible media
+      parameters:
+        - $ref: "#/components/parameters/UploadID"
+      responses:
+        "200":
+          description: Generated JPEG thumbnail.
+          headers:
+            Cache-Control:
+              schema: { type: string }
+          content:
+            image/jpeg:
+              schema: { type: string, format: binary }
+        "404":
+          $ref: "#/components/responses/ResourceNotFound"
+  /media/files/{id}/processing-status:
+    get:
+      tags: [Processing]
+      operationId: getMediaProcessingStatus
+      summary: Get processing status for accessible media
+      parameters:
+        - $ref: "#/components/parameters/UploadID"
+      responses:
+        "200":
+          description: Processing job status.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ProcessingJob"
+        "404":
+          $ref: "#/components/responses/ResourceNotFound"
+  /media/public-links:
+    post:
+      tags: [Public Sharing]
+      operationId: createPublicLink
+      summary: Create an expiring public media or album link
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/CreatePublicLinkRequest"
+      responses:
+        "201":
+          description: Public link created. The plaintext token is returned only here.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/CreatePublicLinkResponse"
+        "400":
+          $ref: "#/components/responses/BadRequest"
+        "403":
+          $ref: "#/components/responses/Forbidden"
+  /media/public-links/{id}:
+    delete:
+      tags: [Public Sharing]
+      operationId: revokePublicLink
+      summary: Revoke an owned public link
+      parameters:
+        - $ref: "#/components/parameters/PublicLinkID"
+      responses:
+        "204":
+          description: Public link revoked.
+        "404":
+          $ref: "#/components/responses/ResourceNotFound"
+  /public/{token}:
+    get:
+      tags: [Public Sharing]
+      operationId: resolvePublicLink
+      summary: Get public-link metadata
+      security: []
+      parameters:
+        - $ref: "#/components/parameters/PublicToken"
+        - $ref: "#/components/parameters/SharePassword"
+      responses:
+        "200":
+          description: Public share metadata.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/PublicLinkContent"
+        "401":
+          description: Share password required or invalid.
+        "404":
+          $ref: "#/components/responses/ResourceNotFound"
+        "429":
+          description: Three failed password attempts locked this token/client pair for five minutes.
+  /public/{token}/download:
+    get:
+      tags: [Public Sharing]
+      operationId: downloadPublicLink
+      summary: Download public media or an album ZIP
+      security: []
+      parameters:
+        - $ref: "#/components/parameters/PublicToken"
+        - $ref: "#/components/parameters/SharePassword"
+      responses:
+        "200":
+          description: Original media bytes or a streamed ZIP archive for an album.
+          content:
+            application/octet-stream:
+              schema: { type: string, format: binary }
+            application/zip:
+              schema: { type: string, format: binary }
+        "401":
+          description: Share password required or invalid.
+        "404":
+          $ref: "#/components/responses/ResourceNotFound"
+        "429":
+          description: Password attempts are temporarily locked.
+  /media/upload-batches:
+    post:
+      tags: [Uploads]
+      operationId: createUploadBatch
+      summary: Create a durable resumable-upload batch
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/CreateUploadBatchRequest"
+      responses:
+        "201":
+          description: Upload batch created.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/UploadBatch"
+        "400":
+          $ref: "#/components/responses/BadRequest"
+  /media/upload-batches/{id}:
+    get:
+      tags: [Uploads]
+      operationId: getUploadBatch
+      summary: Get durable batch progress
+      parameters:
+        - $ref: "#/components/parameters/BatchID"
+      responses:
+        "200":
+          description: Current completed file and byte totals.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/UploadBatch"
+        "404":
+          $ref: "#/components/responses/ResourceNotFound"
+  /media/upload-batches/{id}/cancel:
+    post:
+      tags: [Uploads]
+      operationId: cancelUploadBatch
+      summary: Cancel an active batch
+      description: Prevents new sessions and late upload completions from joining the batch. Already completed media remain available.
+      parameters:
+        - $ref: "#/components/parameters/BatchID"
+      responses:
+        "204":
+          description: Batch canceled.
+        "404":
+          $ref: "#/components/responses/ResourceNotFound"
+  /media/export:
+    get:
+      tags: [Transfer]
+      operationId: exportMediaMetadata
+      summary: Export owned media and manual album metadata
+      responses:
+        "200":
+          description: Versioned JSON metadata manifest.
+          headers:
+            Content-Disposition:
+              schema: { type: string }
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/MetadataManifest"
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+        "500":
+          $ref: "#/components/responses/InternalServerError"
+  /media/import:
+    post:
+      tags: [Transfer]
+      operationId: importMediaMetadata
+      summary: Import manual albums from a versioned metadata manifest
+      description: Album membership is restored only for active media owned by the importing user. The request body is limited to 10 MiB.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/MetadataManifest"
+      responses:
+        "202":
+          description: Import completed and recorded as an import session.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ImportResult"
+        "400":
+          $ref: "#/components/responses/BadRequest"
 components:
   securitySchemes:
     sessionCookie:
@@ -980,6 +1475,42 @@ components:
         administrator, and expires after 30 days. Browser cookies are HttpOnly,
         use path `/`, and are Secure whenever the request is HTTPS.
   parameters:
+    UserID:
+      name: id
+      in: path
+      required: true
+      schema: { type: string, format: uuid }
+      description: Target account UUID.
+    JobID:
+      name: id
+      in: path
+      required: true
+      schema: { type: string, pattern: "^[0-9a-f]{32}$" }
+      description: Processing job identifier, equal to its upload ID.
+    BatchID:
+      name: id
+      in: path
+      required: true
+      schema: { type: string, format: uuid }
+      description: Owner-scoped upload batch UUID.
+    PublicLinkID:
+      name: id
+      in: path
+      required: true
+      schema: { type: string, pattern: "^[0-9a-f]{64}$" }
+      description: Stored SHA-256 identifier returned when the public link was created.
+    PublicToken:
+      name: token
+      in: path
+      required: true
+      schema: { type: string, minLength: 40, maxLength: 64 }
+      description: Opaque plaintext public token returned only at link creation.
+    SharePassword:
+      name: X-Share-Password
+      in: header
+      required: false
+      schema: { type: string, format: password }
+      description: Required when the owner protected the public link with a password.
     AlbumID:
       name: albumId
       in: path
@@ -1088,7 +1619,7 @@ components:
     User:
       type: object
       additionalProperties: false
-      required: [id, username, role, totpEnabled]
+      required: [id, username, role, totpEnabled, storageQuotaBytes, storageUsedBytes, trashRetentionDays]
       properties:
         id:
           type: string
@@ -1105,6 +1636,19 @@ components:
         totpEnabled:
           type: boolean
           description: Whether an active TOTP secret is stored for this account.
+        storageQuotaBytes:
+          type: [integer, "null"]
+          format: int64
+          minimum: 1
+          description: Per-user override or null when the environment default applies.
+        storageUsedBytes:
+          type: integer
+          format: int64
+          minimum: 0
+        trashRetentionDays:
+          type: integer
+          minimum: 1
+          maximum: 3650
     CreateUserRequest:
       type: object
       additionalProperties: false
@@ -1255,6 +1799,32 @@ components:
           type: string
           format: date-time
           description: Present only for owner trash listings.
+        thumbnailUrl:
+          type: string
+          description: Protected thumbnail endpoint, present after processing succeeds.
+        width:
+          type: integer
+          minimum: 1
+        height:
+          type: integer
+          minimum: 1
+        durationSeconds:
+          type: number
+          format: double
+          minimum: 0
+        capturedAt:
+          type: string
+          format: date-time
+        latitude:
+          type: number
+          format: double
+          minimum: -90
+          maximum: 90
+        longitude:
+          type: number
+          format: double
+          minimum: -180
+          maximum: 180
     Storage:
       type: object
       additionalProperties: false
@@ -1305,6 +1875,10 @@ components:
           type: string
           pattern: "^[0-9A-Fa-f]{64}$"
           description: Optional case-insensitive client SHA-256 used to verify the assembled file.
+        batchId:
+          type: string
+          format: uuid
+          description: Optional active upload batch owned by the current user.
     CreateUploadResponse:
       type: object
       additionalProperties: false
@@ -1388,6 +1962,275 @@ components:
         status:
           type: string
           const: deleted
+    RecoveryVerificationRequest:
+      type: object
+      additionalProperties: false
+      required: [challengeToken, code]
+      properties:
+        challengeToken:
+          type: string
+          minLength: 1
+        code:
+          type: string
+          pattern: "^[A-Za-z2-7 -]+$"
+          description: One of the generated Base32 recovery codes. Hyphens, spaces, and letter case are ignored.
+    RecoveryCodesResponse:
+      type: object
+      additionalProperties: false
+      required: [recoveryCodes]
+      properties:
+        recoveryCodes:
+          type: array
+          minItems: 10
+          maxItems: 10
+          items:
+            type: string
+            pattern: "^[A-Z2-7]{4}-[A-Z2-7]{4}-[A-Z2-7]{4}-[A-Z2-7]{4}$"
+    PasswordResetRequest:
+      type: object
+      additionalProperties: false
+      required: [password]
+      properties:
+        password:
+          type: string
+          format: password
+          minLength: 12
+    QuotaRequest:
+      type: object
+      additionalProperties: false
+      required: [storageQuotaBytes]
+      properties:
+        storageQuotaBytes:
+          type: [integer, "null"]
+          format: int64
+          minimum: 1
+          description: Positive per-user limit or null to use the environment default.
+    TrashRetentionRequest:
+      type: object
+      additionalProperties: false
+      required: [days]
+      properties:
+        days:
+          type: integer
+          minimum: 1
+          maximum: 3650
+    StorageDashboard:
+      type: object
+      additionalProperties: false
+      required: [totalUsedBytes, users]
+      properties:
+        totalUsedBytes:
+          type: integer
+          format: int64
+          minimum: 0
+        users:
+          type: array
+          items:
+            $ref: "#/components/schemas/User"
+    ProcessingJob:
+      type: object
+      additionalProperties: false
+      required: [id, uploadId, status, attempts, scheduledFor, updatedAt]
+      properties:
+        id:
+          type: string
+          pattern: "^[0-9a-f]{32}$"
+        uploadId:
+          type: string
+          pattern: "^[0-9a-f]{32}$"
+        ownerId:
+          type: string
+          format: uuid
+          description: Present only on internally claimed jobs; normally omitted from API responses.
+        status:
+          type: string
+          enum: [queued, processing, completed, failed]
+        attempts:
+          type: integer
+          minimum: 0
+        lastError:
+          type: string
+        scheduledFor:
+          type: string
+          format: date-time
+        updatedAt:
+          type: string
+          format: date-time
+    DuplicateCheckRequest:
+      type: object
+      additionalProperties: false
+      required: [sha256]
+      properties:
+        sha256:
+          type: string
+          pattern: "^[0-9A-Fa-f]{64}$"
+    DuplicateMediaSummary:
+      type: object
+      additionalProperties: false
+      required: [id, filename, size, createdAt]
+      properties:
+        id:
+          type: string
+          pattern: "^[0-9a-f]{32}$"
+        filename:
+          type: string
+        size:
+          type: integer
+          format: int64
+          minimum: 1
+        createdAt:
+          type: string
+          format: date-time
+    DuplicateCheckResponse:
+      type: object
+      additionalProperties: false
+      required: [duplicate]
+      properties:
+        duplicate:
+          type: boolean
+        media:
+          $ref: "#/components/schemas/DuplicateMediaSummary"
+          description: Present only when duplicate is true.
+    CreatePublicLinkRequest:
+      type: object
+      additionalProperties: false
+      required: [expiresAt]
+      oneOf:
+        - required: [mediaId]
+        - required: [albumId]
+      properties:
+        mediaId:
+          type: string
+          pattern: "^[0-9a-f]{32}$"
+        albumId:
+          type: string
+          format: uuid
+        password:
+          type: string
+          format: password
+          minLength: 8
+          description: Omit or send an empty string for an unprotected link.
+        expiresAt:
+          type: string
+          format: date-time
+          description: Must be in the future.
+    CreatePublicLinkResponse:
+      type: object
+      additionalProperties: false
+      required: [id, token, url, expiresAt]
+      properties:
+        id:
+          type: string
+          pattern: "^[0-9a-f]{64}$"
+          description: Stored identifier used for owner revocation.
+        token:
+          type: string
+          description: Plaintext opaque token returned only in this response.
+        url:
+          type: string
+          pattern: "^/public/"
+        expiresAt:
+          type: string
+          format: date-time
+    PublicFile:
+      type: object
+      additionalProperties: false
+      required: [filename, mimeType, size]
+      properties:
+        filename: { type: string }
+        mimeType: { type: string }
+        size: { type: integer, format: int64, minimum: 1 }
+    PublicLinkContent:
+      type: object
+      additionalProperties: false
+      required: [title, expiresAt, files]
+      properties:
+        title: { type: string }
+        expiresAt: { type: string, format: date-time }
+        files:
+          type: array
+          items:
+            $ref: "#/components/schemas/PublicFile"
+    CreateUploadBatchRequest:
+      type: object
+      additionalProperties: false
+      required: [name, expectedFiles, expectedBytes]
+      properties:
+        name: { type: string }
+        expectedFiles:
+          type: integer
+          minimum: 1
+          maximum: 10000
+        expectedBytes:
+          type: integer
+          format: int64
+          minimum: 1
+    UploadBatch:
+      type: object
+      additionalProperties: false
+      required: [id, name, expectedFiles, expectedBytes, completedFiles, completedBytes, status, createdAt]
+      properties:
+        id: { type: string, format: uuid }
+        name: { type: string }
+        expectedFiles: { type: integer, minimum: 1 }
+        expectedBytes: { type: integer, format: int64, minimum: 1 }
+        completedFiles: { type: integer, minimum: 0 }
+        completedBytes: { type: integer, format: int64, minimum: 0 }
+        status:
+          type: string
+          enum: [active, completed, canceled]
+        createdAt: { type: string, format: date-time }
+    ManifestMedia:
+      type: object
+      additionalProperties: false
+      required: [id, filename, mimeType, size, sha256, createdAt]
+      properties:
+        id: { type: string, pattern: "^[0-9a-f]{32}$" }
+        filename: { type: string }
+        mimeType: { type: string }
+        size: { type: integer, format: int64, minimum: 1 }
+        sha256: { type: string, pattern: "^[0-9a-f]{64}$" }
+        createdAt: { type: string, format: date-time }
+    ManifestAlbum:
+      type: object
+      additionalProperties: false
+      required: [title, description, mediaIds]
+      properties:
+        title: { type: string, minLength: 1 }
+        description: { type: string }
+        mediaIds:
+          type: array
+          items: { type: string, pattern: "^[0-9a-f]{32}$" }
+    MetadataManifest:
+      type: object
+      additionalProperties: false
+      required: [version, albums]
+      properties:
+        version:
+          type: integer
+          const: 1
+        exportedAt:
+          type: string
+          format: date-time
+          description: Set on exports and ignored during import.
+        media:
+          type: array
+          description: Read-only media inventory; binary files are not imported.
+          items:
+            $ref: "#/components/schemas/ManifestMedia"
+        albums:
+          type: array
+          maxItems: 1000
+          items:
+            $ref: "#/components/schemas/ManifestAlbum"
+    ImportResult:
+      type: object
+      additionalProperties: false
+      required: [sessionId, status, importedAlbums]
+      properties:
+        sessionId: { type: string, format: uuid }
+        status: { type: string, const: completed }
+        importedAlbums: { type: integer, minimum: 0 }
     ErrorResponse:
       type: object
       additionalProperties: false
@@ -1454,13 +2297,16 @@ components:
         application/json:
           schema:
             $ref: "#/components/schemas/ErrorResponse"
-    MissingPart:
-      description: At least one expected upload part is missing.
+    UploadConflict:
+      description: The checksum already belongs to owned media, or at least one expected upload part is missing.
       content:
         application/json:
           schema:
             $ref: "#/components/schemas/ErrorResponse"
           examples:
+            duplicate:
+              value:
+                error: media with this checksum already exists
             missingPart:
               value:
                 error: missing part 2

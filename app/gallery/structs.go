@@ -31,13 +31,25 @@ type Media struct {
 	CreatedAt     time.Time  `json:"createdAt"`
 	DeletedAt     *time.Time `json:"deletedAt,omitempty"`
 	Shared        bool       `json:"shared"`
+	ThumbnailURL  string     `json:"thumbnailUrl,omitempty"`
+	Width         *int       `json:"width,omitempty"`
+	Height        *int       `json:"height,omitempty"`
+	Duration      *float64   `json:"durationSeconds,omitempty"`
+	CapturedAt    *time.Time `json:"capturedAt,omitempty"`
+	Latitude      *float64   `json:"latitude,omitempty"`
+	Longitude     *float64   `json:"longitude,omitempty"`
 }
 
 type MediaFilter struct {
-	Search string
-	Kind   string
-	Sort   string
-	Trash  bool
+	Search         string
+	Kind           string
+	Sort           string
+	Trash          bool
+	CapturedAfter  *time.Time
+	CapturedBefore *time.Time
+	Latitude       *float64
+	Longitude      *float64
+	RadiusKM       *float64
 }
 
 type Storage struct {

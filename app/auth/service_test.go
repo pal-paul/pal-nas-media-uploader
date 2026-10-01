@@ -15,6 +15,7 @@ type memoryRepository struct {
 	challenge          Challenge
 	challengeAvailable bool
 	session            string
+	recoveryCodes      map[string]bool
 }
 
 func (repository *memoryRepository) GetAuthUserByUsername(_ context.Context, username string) (User, error) {
@@ -58,6 +59,44 @@ func (repository *memoryRepository) GetAuthSessionUser(_ context.Context, tokenH
 func (repository *memoryRepository) DeleteAuthSession(context.Context, string) error {
 	repository.session = ""
 	return nil
+}
+func (repository *memoryRepository) ReplaceRecoveryCodes(_ context.Context, _ string, hashes []string) error {
+	repository.recoveryCodes = make(map[string]bool, len(hashes))
+	for _, hash := range hashes {
+		repository.recoveryCodes[hash] = true
+	}
+	return nil
+}
+func (repository *memoryRepository) ConsumeRecoveryCode(_ context.Context, _ string, hash string) (bool, error) {
+	if !repository.recoveryCodes[hash] {
+		return false, nil
+	}
+	delete(repository.recoveryCodes, hash)
+	return true, nil
+}
+
+func TestRecoveryCodeIsSingleUse(t *testing.T) {
+	ctx := context.Background()
+	repository := &memoryRepository{user: passwordUser(t, true)}
+	service := NewService(repository, "PAL Gallery Test")
+	codes, err := service.GenerateRecoveryCodes(ctx, repository.user.ID)
+	if err != nil || len(codes) != 10 {
+		t.Fatalf("generate recovery codes: count=%d err=%v", len(codes), err)
+	}
+	challenge, err := service.BeginLogin(ctx, "admin", "correct-horse-battery")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := service.VerifyRecoveryCode(ctx, challenge.ChallengeToken, codes[0]); err != nil {
+		t.Fatal(err)
+	}
+	challenge, err = service.BeginLogin(ctx, "admin", "correct-horse-battery")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := service.VerifyRecoveryCode(ctx, challenge.ChallengeToken, codes[0]); !errors.Is(err, ErrInvalidCode) {
+		t.Fatalf("reused recovery code returned %v", err)
+	}
 }
 
 func TestEnrollmentCreatesAuthenticatedSession(t *testing.T) {

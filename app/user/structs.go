@@ -3,11 +3,14 @@ package user
 import "time"
 
 type Account struct {
-	ID           string `json:"id"`
-	Username     string `json:"username"`
-	Role         string `json:"role"`
-	UploadFolder string `json:"uploadFolder,omitempty"`
-	TOTPEnabled  bool   `json:"totpEnabled"`
+	ID                 string `json:"id"`
+	Username           string `json:"username"`
+	Role               string `json:"role"`
+	UploadFolder       string `json:"uploadFolder,omitempty"`
+	TOTPEnabled        bool   `json:"totpEnabled"`
+	StorageQuota       *int64 `json:"storageQuotaBytes"`
+	StorageUsed        int64  `json:"storageUsedBytes"`
+	TrashRetentionDays int    `json:"trashRetentionDays"`
 }
 
 type NewAccount struct {

@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"net/http"
 	"net/http/httptest"
+	"net/netip"
 	"testing"
 
 	"github.com/gin-gonic/gin"
@@ -52,5 +53,27 @@ func TestRequireAuthRejectsMissingCookie(t *testing.T) {
 
 	if response.Code != http.StatusUnauthorized {
 		t.Fatalf("got status %d, want %d", response.Code, http.StatusUnauthorized)
+	}
+}
+
+func TestForwardedHeadersRequireTrustedProxy(t *testing.T) {
+	trusted := NewService(&memoryRepository{}, "PAL Gallery Test", WithTrustedProxies([]netip.Prefix{netip.MustParsePrefix("10.0.0.0/8")}))
+	request := httptest.NewRequest(http.MethodGet, "/", nil)
+	request.RemoteAddr = "10.0.0.2:1234"
+	request.Header.Set("X-Forwarded-For", "192.0.2.10, 10.0.0.1")
+	request.Header.Set("X-Forwarded-Proto", "https")
+	if address := trusted.clientAddress(request); address != "192.0.2.10" {
+		t.Fatalf("got client address %q", address)
+	}
+	if cookie := trusted.authCookie(request, "token", 60); !cookie.Secure {
+		t.Fatal("trusted HTTPS proxy did not produce a secure cookie")
+	}
+
+	untrusted := NewService(&memoryRepository{}, "PAL Gallery Test")
+	if address := untrusted.clientAddress(request); address != "10.0.0.2" {
+		t.Fatalf("untrusted proxy changed client address to %q", address)
+	}
+	if cookie := untrusted.authCookie(request, "token", 60); cookie.Secure {
+		t.Fatal("untrusted proxy marked cookie secure")
 	}
 }

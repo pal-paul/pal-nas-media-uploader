@@ -4,10 +4,12 @@ import (
 	"context"
 	"crypto/rand"
 	"crypto/sha256"
+	"encoding/base32"
 	"encoding/base64"
 	"encoding/hex"
 	"errors"
 	"fmt"
+	"net/netip"
 	"strings"
 	"sync"
 	"time"
@@ -39,6 +41,49 @@ type Database interface {
 	CreateAuthSession(context.Context, string, string, time.Time) error
 	GetAuthSessionUser(context.Context, string, time.Time) (User, error)
 	DeleteAuthSession(context.Context, string) error
+	ReplaceRecoveryCodes(context.Context, string, []string) error
+	ConsumeRecoveryCode(context.Context, string, string) (bool, error)
+}
+
+func (service *Service) GenerateRecoveryCodes(ctx context.Context, userID string) ([]string, error) {
+	codes := make([]string, 10)
+	hashes := make([]string, 10)
+	for index := range codes {
+		value := make([]byte, 10)
+		if _, err := rand.Read(value); err != nil {
+			return nil, fmt.Errorf("generate recovery code: %w", err)
+		}
+		encoded := base32.StdEncoding.WithPadding(base32.NoPadding).EncodeToString(value)
+		codes[index] = encoded[:4] + "-" + encoded[4:8] + "-" + encoded[8:12] + "-" + encoded[12:]
+		hashes[index] = recoveryCodeHash(codes[index])
+	}
+	if err := service.database.ReplaceRecoveryCodes(ctx, userID, hashes); err != nil {
+		return nil, err
+	}
+	return codes, nil
+}
+
+func (service *Service) VerifyRecoveryCode(ctx context.Context, challengeToken, code string) (string, error) {
+	hash := tokenHash(challengeToken)
+	challenge, err := service.database.GetAuthChallenge(ctx, hash)
+	if err != nil || time.Now().After(challenge.ExpiresAt) {
+		return "", ErrInvalidChallenge
+	}
+	consumed, err := service.database.ConsumeRecoveryCode(ctx, challenge.UserID, recoveryCodeHash(code))
+	if err != nil {
+		return "", err
+	}
+	if !consumed {
+		return "", ErrInvalidCode
+	}
+	deleted, err := service.database.DeleteAuthChallenge(ctx, hash)
+	if err != nil {
+		return "", err
+	}
+	if !deleted {
+		return "", ErrInvalidChallenge
+	}
+	return service.createSession(ctx, challenge.UserID)
 }
 
 type Service struct {
@@ -48,6 +93,7 @@ type Service struct {
 	loginAttempts      map[string]attemptState
 	verifyAttempts     map[string]attemptState
 	lastAttemptCleanup time.Time
+	trustedProxies     []netip.Prefix
 }
 
 type attemptState struct {
@@ -55,14 +101,27 @@ type attemptState struct {
 	windowStart time.Time
 }
 
+type Option func(*Service)
+
+func WithTrustedProxies(prefixes []netip.Prefix) Option {
+	return func(service *Service) {
+		service.trustedProxies = append([]netip.Prefix(nil), prefixes...)
+	}
+}
+
 func NewService(
 	repository Database,
 	issuer string,
+	options ...Option,
 ) *Service {
-	return &Service{
+	service := &Service{
 		database: repository, issuer: issuer,
 		loginAttempts: make(map[string]attemptState), verifyAttempts: make(map[string]attemptState),
 	}
+	for _, option := range options {
+		option(service)
+	}
+	return service
 }
 
 func (service *Service) allowLogin(username, address string) bool {
@@ -216,4 +275,9 @@ func randomToken() (string, error) {
 func tokenHash(token string) string {
 	hash := sha256.Sum256([]byte(token))
 	return hex.EncodeToString(hash[:])
+}
+
+func recoveryCodeHash(code string) string {
+	normalized := strings.ToUpper(strings.NewReplacer("-", "", " ", "").Replace(strings.TrimSpace(code)))
+	return tokenHash("recovery:" + normalized)
 }

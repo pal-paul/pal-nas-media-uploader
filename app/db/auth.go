@@ -7,6 +7,29 @@ import (
 	"pal-nas-media-uploader/app/auth"
 )
 
+func (store *Postgres) ReplaceRecoveryCodes(ctx context.Context, userID string, hashes []string) error {
+	transaction, err := store.pool.Begin(ctx)
+	if err != nil {
+		return err
+	}
+	defer func() { _ = transaction.Rollback(ctx) }()
+	if _, err := transaction.Exec(ctx, `DELETE FROM totp_recovery_codes WHERE user_id = $1`, userID); err != nil {
+		return err
+	}
+	for _, hash := range hashes {
+		if _, err := transaction.Exec(ctx, `INSERT INTO totp_recovery_codes (user_id, code_hash) VALUES ($1, $2)`, userID, hash); err != nil {
+			return err
+		}
+	}
+	return transaction.Commit(ctx)
+}
+
+func (store *Postgres) ConsumeRecoveryCode(ctx context.Context, userID, hash string) (bool, error) {
+	result, err := store.pool.Exec(ctx, `UPDATE totp_recovery_codes SET used_at = now()
+		WHERE user_id = $1 AND code_hash = $2 AND used_at IS NULL`, userID, hash)
+	return err == nil && result.RowsAffected() == 1, err
+}
+
 func (store *Postgres) AuthUserCount(ctx context.Context) (int, error) {
 	var count int
 	err := store.pool.QueryRow(ctx, `SELECT COUNT(*) FROM users`).Scan(&count)
@@ -70,4 +93,14 @@ func (store *Postgres) GetAuthSessionUser(ctx context.Context, tokenHash string,
 func (store *Postgres) DeleteAuthSession(ctx context.Context, tokenHash string) error {
 	_, err := store.pool.Exec(ctx, `DELETE FROM auth_sessions WHERE token_hash = $1`, tokenHash)
 	return err
+}
+
+func (store *Postgres) CleanupExpiredAuth(ctx context.Context, now time.Time) (int64, error) {
+	var deleted int64
+	err := store.pool.QueryRow(ctx, `WITH deleted_challenges AS (
+		DELETE FROM auth_challenges WHERE expires_at <= $1 RETURNING 1
+	), deleted_sessions AS (
+		DELETE FROM auth_sessions WHERE expires_at <= $1 RETURNING 1
+	) SELECT (SELECT COUNT(*) FROM deleted_challenges) + (SELECT COUNT(*) FROM deleted_sessions)`, now).Scan(&deleted)
+	return deleted, err
 }

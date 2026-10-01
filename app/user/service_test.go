@@ -16,7 +16,19 @@ import (
 type memoryRepository struct {
 	created          NewAccount
 	folder           string
+	passwordHash     string
 	unsharedUsername string
+}
+
+func (repository *memoryRepository) ResetUserPassword(_ context.Context, _ string, passwordHash string) error {
+	repository.passwordHash = passwordHash
+	return nil
+}
+func (repository *memoryRepository) UpdateUserQuota(context.Context, string, *int64) error {
+	return nil
+}
+func (repository *memoryRepository) UpdateTrashRetention(context.Context, string, int) error {
+	return nil
 }
 
 func (repository *memoryRepository) CreateUser(_ context.Context, account NewAccount) error {
@@ -33,6 +45,9 @@ func (repository *memoryRepository) ListAccessibleMedia(context.Context, string)
 }
 func (repository *memoryRepository) GetAccessibleMedia(context.Context, string, string) (Media, error) {
 	return Media{}, nil
+}
+func (repository *memoryRepository) GetAccessibleThumbnailPath(context.Context, string, string) (string, error) {
+	return "", nil
 }
 func (repository *memoryRepository) ShareMedia(context.Context, string, string, string) error {
 	return nil
@@ -62,6 +77,20 @@ func TestRegularUserCannotCreateAccounts(t *testing.T) {
 	_, _, err := service.CreateAccount(context.Background(), "user", "alice", "correct-horse-battery", "user", "alice")
 	if !errors.Is(err, ErrForbidden) {
 		t.Fatalf("got %v", err)
+	}
+}
+
+func TestAdminResetsPassword(t *testing.T) {
+	repository := &memoryRepository{}
+	service := NewService(repository, "PAL Test", t.TempDir())
+	if err := service.ResetPassword(context.Background(), "admin", "user-id", "new-correct-password"); err != nil {
+		t.Fatal(err)
+	}
+	if repository.passwordHash == "" || repository.passwordHash == "new-correct-password" {
+		t.Fatal("expected a password hash")
+	}
+	if err := service.ResetPassword(context.Background(), "user", "user-id", "another-correct-password"); !errors.Is(err, ErrForbidden) {
+		t.Fatalf("regular user reset returned %v", err)
 	}
 }
 

@@ -174,8 +174,10 @@ const mediaSelect = `SELECT m.upload_id, m.owner_id, owner.username,
 	regexp_replace(m.filename, '\.[^.]+$', ''),
 	CASE WHEN m.mime_type LIKE 'video/%' THEN 'video' ELSE 'photo' END,
 	COALESCE(p.favorite, FALSE), m.filename, m.mime_type, m.size, m.sha256, m.created_at,
-	m.deleted_at, m.owner_id <> $2
-	FROM media_uploads m JOIN users owner ON owner.id = m.owner_id `
+	m.deleted_at, m.owner_id <> $2, COALESCE(m.thumbnail_path, ''), m.width, m.height,
+	m.video_duration_seconds, exif.captured_at, exif.latitude, exif.longitude
+	FROM media_uploads m JOIN users owner ON owner.id = m.owner_id
+	LEFT JOIN media_exif exif ON exif.upload_id = m.upload_id `
 
 func (store *Postgres) ListMedia(ctx context.Context, userID string, filter gallery.MediaFilter) ([]gallery.Media, error) {
 	rows, err := store.pool.Query(ctx, mediaSelect+`
@@ -185,10 +187,17 @@ func (store *Postgres) ListMedia(ctx context.Context, userID string, filter gall
 			(NOT $3 AND m.deleted_at IS NULL AND (m.owner_id = $2 OR s.user_id IS NOT NULL)))
 		AND ($4 = '' OR CASE WHEN m.mime_type LIKE 'video/%' THEN 'video' ELSE 'photo' END = $4)
 		AND ($1 = '' OR m.filename ILIKE '%' || $1 || '%' OR m.mime_type ILIKE '%' || $1 || '%')
+		AND ($6::timestamptz IS NULL OR exif.captured_at >= $6)
+		AND ($7::timestamptz IS NULL OR exif.captured_at <= $7)
+		AND ($8::double precision IS NULL OR $9::double precision IS NULL OR $10::double precision IS NULL OR
+			(exif.latitude IS NOT NULL AND exif.longitude IS NOT NULL AND
+			6371 * acos(LEAST(1, cos(radians($8)) * cos(radians(exif.latitude)) *
+			cos(radians(exif.longitude) - radians($9)) + sin(radians($8)) * sin(radians(exif.latitude)))) <= $10))
 		ORDER BY CASE WHEN $5 = 'oldest' THEN m.created_at END ASC,
 			CASE WHEN $5 = 'title' THEN lower(m.filename) END ASC,
 			CASE WHEN $5 NOT IN ('oldest', 'title') THEN m.created_at END DESC`,
-		strings.TrimSpace(filter.Search), userID, filter.Trash, filter.Kind, filter.Sort)
+		strings.TrimSpace(filter.Search), userID, filter.Trash, filter.Kind, filter.Sort,
+		filter.CapturedAfter, filter.CapturedBefore, filter.Latitude, filter.Longitude, filter.RadiusKM)
 	if err != nil {
 		return nil, err
 	}
@@ -251,10 +260,15 @@ func scanGalleryMedia(rows mediaRows) ([]gallery.Media, error) {
 	media := make([]gallery.Media, 0)
 	for rows.Next() {
 		var item gallery.Media
+		var thumbnailPath string
 		if err := rows.Scan(&item.ID, &item.OwnerID, &item.OwnerUsername, &item.Title, &item.Kind,
 			&item.Favorite, &item.Filename, &item.MimeType, &item.Size, &item.SHA256,
-			&item.CreatedAt, &item.DeletedAt, &item.Shared); err != nil {
+			&item.CreatedAt, &item.DeletedAt, &item.Shared, &thumbnailPath, &item.Width, &item.Height,
+			&item.Duration, &item.CapturedAt, &item.Latitude, &item.Longitude); err != nil {
 			return nil, err
+		}
+		if thumbnailPath != "" {
+			item.ThumbnailURL = "/media/files/" + item.ID + "/thumbnail"
 		}
 		media = append(media, item)
 	}

@@ -7,7 +7,9 @@ import (
 	"net/http"
 	"os"
 	"path/filepath"
+	"strconv"
 	"strings"
+	"time"
 
 	"pal-nas-media-uploader/app/auth"
 
@@ -140,6 +142,28 @@ func (service *Service) SetAlbumCover(context *gin.Context) {
 
 func (service *Service) ListMedia(context *gin.Context) {
 	filter := MediaFilter{Search: context.Query("search"), Kind: context.Query("kind"), Sort: context.Query("sort"), Trash: context.Query("trash") == "true"}
+	for value, target := range map[string]**time.Time{
+		context.Query("capturedAfter"): &filter.CapturedAfter, context.Query("capturedBefore"): &filter.CapturedBefore,
+	} {
+		if value != "" {
+			parsed, err := time.Parse(time.RFC3339, value)
+			if err != nil {
+				context.JSON(http.StatusBadRequest, gin.H{"error": "capture dates must use RFC3339"})
+				return
+			}
+			*target = &parsed
+		}
+	}
+	for name, target := range map[string]**float64{"latitude": &filter.Latitude, "longitude": &filter.Longitude, "radiusKm": &filter.RadiusKM} {
+		if value := context.Query(name); value != "" {
+			parsed, err := strconv.ParseFloat(value, 64)
+			if err != nil {
+				context.JSON(http.StatusBadRequest, gin.H{"error": "location filters must be numbers"})
+				return
+			}
+			*target = &parsed
+		}
+	}
 	media, err := service.repository.ListMedia(context, currentUser(context).ID, filter)
 	respond(context, media, err)
 }

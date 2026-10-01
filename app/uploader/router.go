@@ -20,6 +20,7 @@ func RegisterRoutes(router gin.IRoutes, service IUploaderService) error {
 	if router == nil || service == nil {
 		return fmt.Errorf("router and uploader service are required")
 	}
+	router.POST("/media/upload/check", service.HandleCheckDuplicate)
 	router.POST("/media/upload", service.HandleCreateUpload)
 	router.PUT("/media/upload/:id/parts/:part", service.HandleUploadPart)
 	router.POST("/media/upload/:id/complete", service.HandleCompleteUpload)

@@ -4,6 +4,7 @@ import (
 	"crypto/rand"
 	"crypto/sha256"
 	"encoding/hex"
+	"errors"
 	"fmt"
 	"io"
 	"math"
@@ -18,6 +19,41 @@ import (
 
 	"github.com/gin-gonic/gin"
 )
+
+func (s *service) HandleCheckDuplicate(context *gin.Context) {
+	identity, ok := uploadUser(context)
+	if !ok {
+		context.JSON(http.StatusForbidden, gin.H{"error": "uploads require a regular user with an upload folder"})
+		return
+	}
+	if s.mediaStore == nil {
+		internalError(context, fmt.Errorf("check duplicate media: media repository is not configured"))
+		return
+	}
+	context.Request.Body = http.MaxBytesReader(context.Writer, context.Request.Body, maxCreateRequestSize)
+	var request struct {
+		SHA256 string `json:"sha256"`
+	}
+	if err := context.ShouldBindJSON(&request); err != nil {
+		context.JSON(http.StatusBadRequest, gin.H{"error": "invalid duplicate check request"})
+		return
+	}
+	checksum, err := normalizeChecksum(request.SHA256, true)
+	if err != nil {
+		context.JSON(http.StatusBadRequest, gin.H{"error": err.Error()})
+		return
+	}
+	media, duplicate, err := s.mediaStore.FindOwnedMediaBySHA256(context.Request.Context(), identity.ID, checksum)
+	if err != nil {
+		internalError(context, fmt.Errorf("check duplicate media: %w", err))
+		return
+	}
+	response := gin.H{"duplicate": duplicate}
+	if duplicate {
+		response["media"] = gin.H{"id": media.UploadID, "filename": media.Filename, "size": media.Size, "createdAt": media.CreatedAt}
+	}
+	context.JSON(http.StatusOK, response)
+}
 
 func (s *service) HandleCreateUpload(context *gin.Context) {
 	identity, ok := uploadUser(context)
@@ -40,13 +76,25 @@ func (s *service) HandleCreateUpload(context *gin.Context) {
 		context.JSON(http.StatusBadRequest, gin.H{"error": fmt.Sprintf("size must be between 1 and %d bytes", s.maxUploadSize)})
 		return
 	}
-	checksum := strings.ToLower(strings.TrimSpace(req.SHA256))
-	if checksum != "" {
-		decoded, decodeErr := hex.DecodeString(checksum)
-		if decodeErr != nil || len(decoded) != sha256.Size {
-			context.JSON(http.StatusBadRequest, gin.H{"error": "sha256 must be a 64-character hexadecimal value"})
+	checksum, err := normalizeChecksum(req.SHA256, false)
+	if err != nil {
+		context.JSON(http.StatusBadRequest, gin.H{"error": err.Error()})
+		return
+	}
+	if checksum != "" && s.mediaStore != nil {
+		_, duplicate, err := s.mediaStore.FindOwnedMediaBySHA256(context.Request.Context(), identity.ID, checksum)
+		if err != nil {
+			internalError(context, fmt.Errorf("check duplicate media: %w", err))
 			return
 		}
+		if duplicate {
+			context.JSON(http.StatusConflict, gin.H{"error": ErrDuplicateMedia.Error()})
+			return
+		}
+	}
+	if req.BatchID != "" && (s.mediaStore == nil || s.mediaStore.ValidateUploadBatch(context.Request.Context(), req.BatchID, identity.ID) != nil) {
+		context.JSON(http.StatusBadRequest, gin.H{"error": "active upload batch not found"})
+		return
 	}
 	if len(req.MimeType) > 255 {
 		context.JSON(http.StatusBadRequest, gin.H{"error": "mime_type is too long"})
@@ -63,16 +111,23 @@ func (s *service) HandleCreateUpload(context *gin.Context) {
 	u := &Upload{
 		ID: id, OwnerID: identity.ID, UserFolder: identity.UploadFolder,
 		Filename: filename, MimeType: req.MimeType, Size: req.Size,
-		SHA256: checksum, Chunks: chunks, Created: time.Now().UTC(),
+		SHA256: checksum, BatchID: req.BatchID, Chunks: chunks, Created: time.Now().UTC(),
 	}
 	s.uploadMux.Lock()
 	defer s.uploadMux.Unlock()
 	stored := int64(0)
+	storageQuota := s.maxStorageSize
 	if s.mediaStore != nil {
 		stored, err = s.mediaStore.OwnerStorageBytes(context.Request.Context(), identity.ID)
 		if err != nil {
 			internalError(context, fmt.Errorf("read owner storage usage: %w", err))
 			return
+		}
+		if quota, configured, quotaErr := s.mediaStore.OwnerStorageQuota(context.Request.Context(), identity.ID); quotaErr != nil {
+			internalError(context, fmt.Errorf("read owner storage quota: %w", quotaErr))
+			return
+		} else if configured {
+			storageQuota = quota
 		}
 	}
 	active, pending := 0, int64(0)
@@ -86,9 +141,9 @@ func (s *service) HandleCreateUpload(context *gin.Context) {
 			}
 		}
 	}
-	storageExceeded := quotaExceeded(stored, pending, s.maxStorageSize)
+	storageExceeded := quotaExceeded(stored, pending, storageQuota)
 	if !storageExceeded {
-		storageExceeded = quotaExceeded(stored+pending, u.Size, s.maxStorageSize)
+		storageExceeded = quotaExceeded(stored+pending, u.Size, storageQuota)
 	}
 	if active >= s.maxActive || quotaExceeded(pending, u.Size, s.maxPendingSize) || storageExceeded {
 		context.JSON(http.StatusTooManyRequests, gin.H{"error": "upload quota exceeded"})
@@ -129,6 +184,9 @@ func (s *service) HandleUploadPart(context *gin.Context) {
 	expected := chunkSize
 	if part == u.Chunks-1 {
 		expected = u.Size - part*chunkSize
+	}
+	if !s.hasDiskCapacity(context, s.tmpDir, expected) {
+		return
 	}
 	context.Request.Body = http.MaxBytesReader(context.Writer, context.Request.Body, expected+1)
 	path := filepath.Join(s.tmpDir, u.ID, fmt.Sprintf("%08d.part", part))
@@ -192,6 +250,9 @@ func (s *service) HandleCompleteUpload(context *gin.Context) {
 		}
 	}
 	finalPath := filepath.Join(s.mediaDir, u.MediaPath)
+	if !s.hasDiskCapacity(context, s.mediaDir, u.Size) {
+		return
+	}
 	outDir := filepath.Dir(finalPath)
 	if err := os.MkdirAll(outDir, 0750); err != nil {
 		internalError(context, fmt.Errorf("create media directory: %w", err))
@@ -261,9 +322,17 @@ func (s *service) HandleCompleteUpload(context *gin.Context) {
 			Size:      total,
 			SHA256:    sum,
 			MediaPath: filepath.ToSlash(u.MediaPath),
+			BatchID:   u.BatchID,
 			CreatedAt: u.Completed,
 		}
 		if err := s.mediaStore.SaveCompletedMedia(context.Request.Context(), media); err != nil {
+			if removeErr := os.Remove(finalPath); removeErr != nil && !os.IsNotExist(removeErr) {
+				_ = context.Error(fmt.Errorf("remove uncommitted media: %w", removeErr))
+			}
+			if errors.Is(err, ErrDuplicateMedia) {
+				context.JSON(http.StatusConflict, gin.H{"error": ErrDuplicateMedia.Error()})
+				return
+			}
 			internalError(context, fmt.Errorf("save completed media: %w", err))
 			return
 		}
@@ -331,6 +400,19 @@ func quotaExceeded(used, requested, limit int64) bool {
 	return used > limit || requested > limit-used
 }
 
+func (s *service) hasDiskCapacity(context *gin.Context, path string, required int64) bool {
+	available, err := s.diskFree(path)
+	if err != nil {
+		internalError(context, fmt.Errorf("check free disk space: %w", err))
+		return false
+	}
+	if quotaExceeded(s.minDiskFree, required, available) {
+		context.JSON(http.StatusServiceUnavailable, gin.H{"error": "insufficient disk space"})
+		return false
+	}
+	return true
+}
+
 func generateUniqueID() (string, error) {
 	b := make([]byte, 16)
 	if _, err := rand.Read(b); err != nil {
@@ -373,6 +455,18 @@ func sanitizeFilename(filename string) (string, error) {
 		return "", fmt.Errorf("filename is too long")
 	}
 	return filename, nil
+}
+
+func normalizeChecksum(value string, required bool) (string, error) {
+	checksum := strings.ToLower(strings.TrimSpace(value))
+	if checksum == "" && !required {
+		return "", nil
+	}
+	decoded, err := hex.DecodeString(checksum)
+	if err != nil || len(decoded) != sha256.Size {
+		return "", fmt.Errorf("sha256 must be a 64-character hexadecimal value")
+	}
+	return checksum, nil
 }
 
 func firstError(errors ...error) error {

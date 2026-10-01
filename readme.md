@@ -4,9 +4,15 @@ Go API for multi-user, resumable media uploads. Administrators manage accounts;
 regular users upload into their own folders and can share their current and
 future media library with other regular users. Managed accounts use TOTP.
 
+The full backend entrypoint is [`cmd/server`](cmd/server). Container images run
+it as `/app/pal-media-server`; the existing Compose service remains named
+`uploader` for deployment compatibility. The upload-specific implementation
+continues to live under `app/uploader`.
+
 ## Requirements
 
 - Docker with Docker Compose
+- An amd64 or arm64 NAS/host
 - A TOTP authenticator application
 - `curl`, `jq`, `file`, `shasum`, and `split` for the API examples
 
@@ -279,6 +285,10 @@ The complete OpenAPI 3.1 contract is in
 [spec/openapi.yaml](spec/openapi.yaml). Domain boundaries, multi-user ownership,
 and the complete gallery route set are described in
 [docs/backend-api.md](docs/backend-api.md).
+
+Synology Container Manager deployment, reverse-proxy, health monitoring,
+backup, restore, and integrity procedures are documented in
+[docs/synology.md](docs/synology.md).
 
 ## Development checks
 

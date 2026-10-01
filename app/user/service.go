@@ -20,16 +20,54 @@ var ErrInvalidFolder = errors.New("upload folder must be a relative path without
 //go:embed templates/config.html
 var configurationTemplates embed.FS
 
-var configurationTemplate = template.Must(template.ParseFS(configurationTemplates, "templates/config.html"))
+var configurationTemplate = template.Must(template.ParseFS(configurationTemplates, "templates/*.html"))
 
 type Repository interface {
 	CreateUser(context.Context, NewAccount) error
 	ListUsers(context.Context) ([]Account, error)
 	UpdateUserFolder(context.Context, string, string) error
+	ResetUserPassword(context.Context, string, string) error
+	UpdateUserQuota(context.Context, string, *int64) error
+	UpdateTrashRetention(context.Context, string, int) error
 	ListAccessibleMedia(context.Context, string) ([]Media, error)
 	GetAccessibleMedia(context.Context, string, string) (Media, error)
+	GetAccessibleThumbnailPath(context.Context, string, string) (string, error)
 	ShareMedia(context.Context, string, string, string) error
 	UnshareMedia(context.Context, string, string, string) error
+}
+
+func (service *Service) SetTrashRetention(ctx context.Context, actorRole, userID string, days int) error {
+	if actorRole != "admin" {
+		return ErrForbidden
+	}
+	if days < 1 || days > 3650 {
+		return errors.New("trash retention must be between 1 and 3650 days")
+	}
+	return service.repository.UpdateTrashRetention(ctx, userID, days)
+}
+
+func (service *Service) SetQuota(ctx context.Context, actorRole, userID string, quota *int64) error {
+	if actorRole != "admin" {
+		return ErrForbidden
+	}
+	if quota != nil && *quota < 1 {
+		return errors.New("storage quota must be positive or null")
+	}
+	return service.repository.UpdateUserQuota(ctx, userID, quota)
+}
+
+func (service *Service) ResetPassword(ctx context.Context, actorRole, userID, password string) error {
+	if actorRole != "admin" {
+		return ErrForbidden
+	}
+	if len(password) < 12 {
+		return errors.New("password must be at least 12 characters")
+	}
+	hash, err := bcrypt.GenerateFromPassword([]byte(password), bcrypt.DefaultCost)
+	if err != nil {
+		return fmt.Errorf("hash password: %w", err)
+	}
+	return service.repository.ResetUserPassword(ctx, userID, string(hash))
 }
 
 type Service struct {

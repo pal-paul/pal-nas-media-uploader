@@ -8,15 +8,21 @@ need to match Go package names.
 
 <!-- markdownlint-disable MD013 -->
 
-| Domain | Responsibility |
-| --- | --- |
-| `setup` | Bootstrap-authorized creation of the first persistent administrator. |
-| `auth` | Login, TOTP verification, sessions, and logout. |
-| `user` | Accounts, roles, upload folders, downloads, and owner-managed shares. |
-| `uploader` | Resumable upload sessions, chunks, completion, and cancellation. |
-| `autoalbum` | Nightly weekly and high-volume daily album reconciliation. |
-| `gallery` | Albums, accessible media, personal favorites, trash, and storage totals. |
-| `db` | PostgreSQL implementations of domain repository contracts. |
+| Domain        | Responsibility                                                                 |
+| ------------- | ------------------------------------------------------------------------------ |
+| `setup`       | Bootstrap-authorized creation of the first persistent administrator.           |
+| `auth`        | Login, TOTP verification, sessions, and logout.                                |
+| `user`        | Accounts, roles, upload folders, downloads, and owner-managed shares.          |
+| `uploader`    | Resumable upload sessions, chunks, completion, and cancellation.               |
+| `autoalbum`   | Nightly weekly and high-volume daily album reconciliation.                     |
+| `gallery`     | Albums, accessible media, personal favorites, trash, and storage totals.       |
+| `processing`  | Durable FFmpeg jobs, thumbnails, dimensions, duration, EXIF, and GPS metadata. |
+| `publicshare` | Expiring, optionally password-protected public media and album links.          |
+| `batch`       | Durable multi-file upload progress and cancellation.                           |
+| `transfer`    | Versioned metadata export and manual-album import.                             |
+| `trash`       | Per-user retention and scheduled physical-file cleanup.                        |
+| `operations`  | Liveness, readiness, cleanup scheduling, and media integrity reporting.        |
+| `db`          | PostgreSQL implementations of domain repository contracts.                     |
 
 The domains share an authenticated user identity but do not call each other's
 HTTP handlers. For example, `gallery` uses completed uploads as media records;
@@ -43,6 +49,62 @@ it does not implement file transfer again.
 - Resource lookups are scoped by the authenticated user. An inaccessible ID is
   reported as not found rather than exposing another user's data.
 
+## Synology NAS quick install
+
+This deployment uses Synology Container Manager and bind-mounts all persistent
+data under `/volume1/docker/pal-media`. It supports amd64 and arm64 NAS models.
+
+1. Install **Container Manager** from DSM Package Center and enable SSH
+   temporarily in **Control Panel > Terminal & SNMP**.
+2. Copy or clone this repository onto the NAS, open an SSH session, and change
+   to the repository root.
+3. Create the persistent directories:
+
+```sh
+mkdir -p /volume1/docker/pal-media/{postgres,media,tmp,backups}
+```
+
+1. Create the environment file and edit it before starting containers:
+
+```sh
+cp .env.example .env
+chmod 600 .env
+```
+
+At minimum, replace `POSTGRES_PASSWORD` and `ENV_ADMIN_PASSWORD`. The
+bootstrap administrator password must be at least 12 characters. Confirm
+`NAS_POSTGRES_PATH`, `NAS_MEDIA_PATH`, and `NAS_UPLOAD_TMP_PATH` point to the
+volume created above. If DSM reverse proxy will be used, set
+`ENV_CORS_ALLOWED_ORIGINS` to its external HTTPS origin.
+
+1. Build and start the Container Manager project:
+
+```sh
+docker compose --env-file .env \
+  -f build/compose.yaml -f build/compose.synology.yaml \
+  up -d --build
+```
+
+1. Wait for PostgreSQL and the media server to become healthy, then verify:
+
+```sh
+docker compose --env-file .env \
+  -f build/compose.yaml -f build/compose.synology.yaml ps
+curl -fsS http://127.0.0.1:8081/readyz
+```
+
+1. Open `http://NAS-IP:8081/setup`, enter the bootstrap credentials from
+   `.env`, and create the permanent administrator. Enroll its TOTP token on
+   first login. Then use `/admin/config` to create regular users.
+
+The application container runs as a non-root user. Ensure the Container
+Manager project has read/write permission to the three bind-mounted folders if
+readiness reports a storage error. For HTTPS, configure DSM **Login Portal >
+Advanced > Reverse Proxy**, forward to port `8081`, and set
+`ENV_TRUSTED_PROXIES` to the DSM proxy source address or CIDR. Disable SSH again
+after installation. Backup and restore procedures are documented in
+[Synology deployment and operations](synology.md).
+
 ## Base URL and authentication
 
 The default local URL is `http://localhost:8081`. The one-time `/setup` routes
@@ -52,81 +114,201 @@ and the authentication routes are public. All other routes require the
 Browser requests must include credentials:
 
 ```js
-await fetch(`${baseUrl}/albums`, { credentials: 'include' })
+await fetch(`${baseUrl}/albums`, { credentials: "include" });
 ```
 
 Administrators manage accounts but cannot upload or use gallery routes. Regular
 users can upload and use the gallery. Accounts created by an administrator use
 password plus TOTP. Environment bootstrap credentials authorize only the
 one-time setup form and are never stored as a login account. The first
-persistent administrator uses its configured password without TOTP.
+persistent administrator enrolls TOTP on first login.
 
-`ENV_FRONTEND_PAGES_ENABLED=YES` serves `/setup` and `/admin/config`; `NO`
-returns `404` for those HTML pages without disabling the JSON APIs.
+`ENV_FRONTEND_PAGES_ENABLED=YES` serves `/setup`, `/admin/config`, and
+`/media/app`; `NO` returns `404` for those HTML pages without disabling the
+JSON APIs.
 
 ## Endpoint summary
 
 ### Authentication and users
 
-| Method | Path | Access | Purpose |
-| --- | --- | --- | --- |
-| `GET` | `/setup` | Public, before setup | Open initial administrator setup. |
-| `POST` | `/setup` | Public, before setup | Create the first administrator. |
-| `POST` | `/auth/login` | Public | Start password/TOTP login. |
-| `POST` | `/auth/verify` | Public | Verify TOTP and issue a session cookie. |
-| `GET` | `/auth/session` | Authenticated | Return the current identity and role. |
-| `POST` | `/auth/logout` | Authenticated | Delete the current session. |
-| `GET` | `/admin/config` | Admin | Open the account configuration page. |
-| `GET` | `/admin/users` | Admin | List accounts. |
-| `POST` | `/admin/users` | Admin | Create an account and one-time TOTP setup. |
-| `PUT` | `/users/me/folder` | Regular user | Change the user's upload folder. |
+| Method  | Path                                | Access               | Purpose                                                       |
+| ------- | ----------------------------------- | -------------------- | ------------------------------------------------------------- |
+| `GET`   | `/setup`                            | Public, before setup | Open initial administrator setup.                             |
+| `POST`  | `/setup`                            | Public, before setup | Create the first administrator.                               |
+| `POST`  | `/auth/login`                       | Public               | Start password/TOTP login.                                    |
+| `POST`  | `/auth/verify`                      | Public               | Verify TOTP and issue a session cookie.                       |
+| `POST`  | `/auth/recovery`                    | Public               | Verify a single-use recovery code and issue a session cookie. |
+| `GET`   | `/auth/session`                     | Authenticated        | Return the current identity and role.                         |
+| `POST`  | `/auth/logout`                      | Authenticated        | Delete the current session.                                   |
+| `POST`  | `/auth/recovery-codes`              | Authenticated        | Replace and return ten single-use recovery codes.             |
+| `GET`   | `/admin/config`                     | Admin                | Open the account configuration page.                          |
+| `GET`   | `/admin/users`                      | Admin                | List accounts.                                                |
+| `POST`  | `/admin/users`                      | Admin                | Create an account and one-time TOTP setup.                    |
+| `PATCH` | `/admin/users/{id}/password`        | Admin                | Reset a password and revoke that user's sessions.             |
+| `PATCH` | `/admin/users/{id}/quota`           | Admin                | Set a per-user storage quota or use the default.              |
+| `PATCH` | `/admin/users/{id}/trash-retention` | Admin                | Set a user's trash retention period.                          |
+| `GET`   | `/admin/storage/dashboard`          | Admin                | Return per-user and total storage usage.                      |
+| `GET`   | `/admin/processing-jobs`            | Admin                | List durable media-processing jobs.                           |
+| `POST`  | `/admin/processing-jobs/{id}/retry` | Admin                | Retry a failed processing job.                                |
+| `POST`  | `/admin/trash/cleanup`              | Admin                | Run expired-trash cleanup immediately.                        |
+| `PUT`   | `/users/me/folder`                  | Regular user         | Change the user's upload folder.                              |
+| `GET`   | `/media/app`                        | Regular user         | Open the embedded media workspace.                            |
+| `GET`   | `/healthz`                          | Public               | Report process liveness.                                      |
+| `GET`   | `/readyz`                           | Public               | Check PostgreSQL and filesystem reserve.                      |
+| `GET`   | `/admin/operations/integrity`       | Admin                | Compare media records and filesystem files.                   |
+
+## Client API flows
+
+The browser or API client calls only the media server. Authenticated routes
+use the `pal_medias_uploader_session` cookie; PostgreSQL and the media volume
+are internal implementation details.
+
+```mermaid
+flowchart LR
+  C["Browser or API client"]
+  U["Media server"]
+  DB[(PostgreSQL)]
+  FS[(NAS media volume)]
+  W["Processing worker"]
+
+  C -->|"Setup and login<br/>/setup, /auth/*"| U
+  C -->|"Admin APIs<br/>/admin/*"| U
+  C -->|"Gallery and albums<br/>/media, /albums, /storage"| U
+  C -->|"Resumable uploads<br/>/media/upload*"| U
+  C -->|"Batch and transfer<br/>/media/upload-batches*, /media/export, /media/import"| U
+  C -->|"Public links<br/>/public/{token}"| U
+  U --> DB
+  U --> FS
+  DB --> W
+  W --> FS
+  W --> DB
+```
+
+Password login returns a short-lived challenge. Complete it with either TOTP
+or a previously generated single-use recovery code; the response sets the
+session cookie used by subsequent calls.
+
+```mermaid
+sequenceDiagram
+  actor Client
+  participant API as Media server API
+
+  Client->>API: POST /auth/login (username, password)
+  API-->>Client: challengeToken
+  alt TOTP
+    Client->>API: POST /auth/verify (challengeToken, code)
+  else Recovery code
+    Client->>API: POST /auth/recovery (challengeToken, code)
+  end
+  API-->>Client: Set-Cookie: pal_medias_uploader_session
+  Client->>API: GET /auth/session (session cookie)
+  API-->>Client: Current identity and role
+```
+
+A regular user can preflight a checksum, create a durable batch, and upload
+each file in fixed-size parts. The processing status and thumbnail endpoints
+become useful after completion enqueues the media job.
+
+```mermaid
+sequenceDiagram
+  actor Client
+  participant API as Media server API
+  participant Worker as Processing worker
+
+  Client->>API: POST /media/upload/check (sha256)
+  API-->>Client: duplicate and optional media
+  Client->>API: POST /media/upload-batches
+  API-->>Client: batch id
+  Client->>API: POST /media/upload (metadata, batchId)
+  API-->>Client: upload id, chunk size, chunk count
+  loop Each zero-based part
+    Client->>API: PUT /media/upload/{id}/parts/{part}
+    API-->>Client: Accepted part
+  end
+  Client->>API: POST /media/upload/{id}/complete
+  API-->>Client: Completed media and SHA-256
+  API->>Worker: Enqueue PostgreSQL processing job
+  Client->>API: GET /media/files/{id}/processing-status
+  API-->>Client: queued, processing, completed, or failed
+  Client->>API: GET /media/files/{id}/thumbnail
+  API-->>Client: Thumbnail bytes
+```
+
+After login, clients can independently use the remaining API groups:
+
+```mermaid
+flowchart TD
+  S["Authenticated session"]
+  S --> A["Admin role"]
+  S --> R["Regular user role"]
+  A --> AU["Accounts, quotas, retention<br/>/admin/users/*"]
+  A --> AO["Jobs and operations<br/>/admin/processing-jobs*, /admin/operations/*"]
+  R --> G["Gallery and albums<br/>/media, /albums/*, /storage"]
+  R --> P["Public link management<br/>/media/public-links*"]
+  R --> T["Metadata transfer<br/>/media/export, /media/import"]
+  P --> X["Unauthenticated recipient<br/>/public/{token}<br/>/public/{token}/download"]
+```
 
 ### Uploads
 
-| Method | Path | Purpose |
-| --- | --- | --- |
-| `POST` | `/media/upload` | Create a resumable upload. |
-| `GET` | `/media/upload/{id}` | List uploaded part numbers. |
-| `PUT` | `/media/upload/{id}/parts/{part}` | Upload or replace one zero-based part. |
-| `POST` | `/media/upload/{id}/complete` | Verify and assemble completed media. |
-| `DELETE` | `/media/upload/{id}` | Cancel an incomplete upload. |
+| Method   | Path                                | Purpose                                      |
+| -------- | ----------------------------------- | -------------------------------------------- |
+| `POST`   | `/media/upload/check`               | Check for owned media with the same SHA-256. |
+| `POST`   | `/media/upload-batches`             | Create a durable multi-file batch.           |
+| `GET`    | `/media/upload-batches/{id}`        | Get batch file and byte progress.            |
+| `POST`   | `/media/upload-batches/{id}/cancel` | Cancel an active batch.                      |
+| `POST`   | `/media/upload`                     | Create a resumable upload.                   |
+| `GET`    | `/media/upload/{id}`                | List uploaded part numbers.                  |
+| `PUT`    | `/media/upload/{id}/parts/{part}`   | Upload or replace one zero-based part.       |
+| `POST`   | `/media/upload/{id}/complete`       | Verify and assemble completed media.         |
+| `DELETE` | `/media/upload/{id}`                | Cancel an incomplete upload.                 |
 
 Upload sessions belong to the user who created them. Parts use a fixed 8 MiB
-size except for the final part. See [the OpenAPI contract](../spec/openapi.yaml)
+size except for the final part. Incomplete sessions older than
+`ENV_UPLOAD_RETENTION` are removed by the cleanup scheduler. See [the OpenAPI contract](../spec/openapi.yaml)
 for complete request and response schemas.
 
 ### Media and sharing
 
-| Method | Path | Access | Purpose |
-| --- | --- | --- | --- |
-| `GET` | `/media` | Regular user | List active owned and shared media. |
-| `GET` | `/media?trash=true` | Regular user | List only the current user's trash. |
-| `GET` | `/media/files/{id}/download` | Owner or recipient | Download active media. |
-| `POST` | `/media/files/{id}/shares` | Owner | Share all current and future media with `{ "username": "bob" }`. |
-| `DELETE` | `/media/files/{id}/shares?username=bob` | Owner | Remove Bob's library-wide access. |
-| `PATCH` | `/media/files/{id}/favorite` | Owner or recipient | Set personal favorite state. |
-| `DELETE` | `/media/files/{id}` | Owner | Move media to trash. |
-| `PATCH` | `/media/files/{id}/restore` | Owner | Restore media from trash. |
-| `DELETE` | `/media/files/{id}/permanent` | Owner | Delete the file and database record. |
-| `GET` | `/storage` | Regular user | Return totals for accessible active media. |
+| Method   | Path                                    | Access             | Purpose                                                          |
+| -------- | --------------------------------------- | ------------------ | ---------------------------------------------------------------- |
+| `GET`    | `/media`                                | Regular user       | List active owned and shared media.                              |
+| `GET`    | `/media?trash=true`                     | Regular user       | List only the current user's trash.                              |
+| `GET`    | `/media/files/{id}/download`            | Owner or recipient | Download active media.                                           |
+| `GET`    | `/media/files/{id}/thumbnail`           | Owner or recipient | Download the generated thumbnail.                                |
+| `GET`    | `/media/files/{id}/processing-status`   | Owner              | Get processing job status.                                       |
+| `POST`   | `/media/files/{id}/shares`              | Owner              | Share all current and future media with `{ "username": "bob" }`. |
+| `DELETE` | `/media/files/{id}/shares?username=bob` | Owner              | Remove Bob's library-wide access.                                |
+| `PATCH`  | `/media/files/{id}/favorite`            | Owner or recipient | Set personal favorite state.                                     |
+| `DELETE` | `/media/files/{id}`                     | Owner              | Move media to trash.                                             |
+| `PATCH`  | `/media/files/{id}/restore`             | Owner              | Restore media from trash.                                        |
+| `DELETE` | `/media/files/{id}/permanent`           | Owner              | Delete the file and database record.                             |
+| `GET`    | `/storage`                              | Regular user       | Return totals for accessible active media.                       |
+| `POST`   | `/media/public-links`                   | Owner              | Create an expiring media or album link.                          |
+| `DELETE` | `/media/public-links/{id}`              | Owner              | Revoke a public link.                                            |
+| `GET`    | `/public/{token}`                       | Public             | Inspect active public-link content.                              |
+| `GET`    | `/public/{token}/download`              | Public             | Download linked media or an album ZIP.                           |
+| `GET`    | `/media/export`                         | Regular user       | Export versioned media and album metadata.                       |
+| `POST`   | `/media/import`                         | Regular user       | Import manual albums for currently owned media.                  |
 
 `GET /media` supports `search`, `kind=photo|video`,
-`sort=newest|oldest|title`, and `trash=true`. A returned item's `shared` field
-is `true` when the current user is a recipient rather than its owner.
+`sort=newest|oldest|title`, `trash=true`, capture-time ranges, and GPS radius
+search. A returned item's `shared` field is `true` when the current user is a
+recipient rather than its owner.
 
 ### Albums
 
-| Method | Path | Purpose |
-| --- | --- | --- |
-| `GET` | `/albums` | List the current user's albums. |
-| `POST` | `/albums` | Create an album. |
-| `PATCH` | `/albums/order` | Set album display order. |
-| `GET` | `/albums/{albumId}` | Get an album and accessible active media. |
-| `PATCH` | `/albums/{albumId}` | Update title and description. |
-| `DELETE` | `/albums/{albumId}` | Delete the album, not its media. |
-| `POST` | `/albums/{albumId}/media` | Add owned or shared media. |
-| `DELETE` | `/albums/{albumId}/media/{id}` | Remove media from the album. |
-| `PATCH` | `/albums/{albumId}/cover` | Set an accessible album member as cover. |
+| Method   | Path                           | Purpose                                   |
+| -------- | ------------------------------ | ----------------------------------------- |
+| `GET`    | `/albums`                      | List the current user's albums.           |
+| `POST`   | `/albums`                      | Create an album.                          |
+| `PATCH`  | `/albums/order`                | Set album display order.                  |
+| `GET`    | `/albums/{albumId}`            | Get an album and accessible active media. |
+| `PATCH`  | `/albums/{albumId}`            | Update title and description.             |
+| `DELETE` | `/albums/{albumId}`            | Delete the album, not its media.          |
+| `POST`   | `/albums/{albumId}/media`      | Add owned or shared media.                |
+| `DELETE` | `/albums/{albumId}/media/{id}` | Remove media from the album.              |
+| `PATCH`  | `/albums/{albumId}/cover`      | Set an accessible album member as cover.  |
 
 <!-- markdownlint-enable MD013 -->
 
@@ -164,24 +346,25 @@ Add media:
 }
 ```
 
-## Deliberately separate concerns
+## Processing boundary
 
-The earlier endpoint inventory included filesystem scanning and generated video
-thumbnails. They are not part of the synchronous gallery domain implemented
-here. Automatic albums draw from completed media records whose owner was set by
-an authenticated upload, so their owner is unambiguous. A filesystem scanner
-would still need an explicit owner, and thumbnail generation should run as a
-media-processing concern with its own cache and job lifecycle.
+Thumbnail and metadata extraction are intentionally asynchronous. Completing
+an upload creates a PostgreSQL-backed processing job; the in-process worker
+uses FFmpeg and FFprobe and persists its progress across container restarts.
+The gallery remains responsible for access and presentation, while processing
+owns generated thumbnails, dimensions, duration, capture time, EXIF, and GPS.
+Filesystem integrity scanning remains an administrator operation and never
+imports unowned files automatically.
 
 ## Errors
 
 JSON errors use an `error` field:
 
 ```json
-{"error":"not found"}
+{ "error": "not found" }
 ```
 
 Common statuses are `400` for invalid input, `401` for a missing or invalid
 session, `403` for the wrong role, `404` for missing or inaccessible resources,
-`409` for missing upload parts, `500` for internal failures, and `502` when a
-physical file cannot be deleted.
+`409` for missing upload parts or duplicate media, `500` for internal failures,
+and `502` when a physical file cannot be deleted.

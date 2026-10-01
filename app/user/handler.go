@@ -41,6 +41,17 @@ func (service *Service) ConfigurationPage(context *gin.Context) {
 	}
 }
 
+func (service *Service) MediaPage(context *gin.Context) {
+	if !service.frontendPages {
+		context.Status(http.StatusNotFound)
+		return
+	}
+	context.Header("Content-Type", "text/html; charset=utf-8")
+	if err := configurationTemplate.ExecuteTemplate(context.Writer, "media.html", nil); err != nil {
+		internalError(context, err)
+	}
+}
+
 func (service *Service) ListUsers(context *gin.Context) {
 	accounts, err := service.repository.ListUsers(context.Request.Context())
 	if err != nil {
@@ -48,6 +59,51 @@ func (service *Service) ListUsers(context *gin.Context) {
 		return
 	}
 	context.JSON(http.StatusOK, accounts)
+}
+
+func (service *Service) StorageDashboard(context *gin.Context) {
+	accounts, err := service.repository.ListUsers(context.Request.Context())
+	if err != nil {
+		internalError(context, err)
+		return
+	}
+	var total int64
+	for _, account := range accounts {
+		total += account.StorageUsed
+	}
+	context.JSON(http.StatusOK, gin.H{"totalUsedBytes": total, "users": accounts})
+}
+
+func (service *Service) SetUserQuota(context *gin.Context) {
+	identity, _ := currentUser(context)
+	var request struct {
+		StorageQuota *int64 `json:"storageQuotaBytes"`
+	}
+	if err := decodeJSON(context, &request); err != nil {
+		context.JSON(http.StatusBadRequest, gin.H{"error": "invalid quota request"})
+		return
+	}
+	if err := service.SetQuota(context.Request.Context(), identity.Role, context.Param("id"), request.StorageQuota); err != nil {
+		context.JSON(http.StatusBadRequest, gin.H{"error": err.Error()})
+		return
+	}
+	context.Status(http.StatusNoContent)
+}
+
+func (service *Service) SetUserTrashRetention(context *gin.Context) {
+	identity, _ := currentUser(context)
+	var request struct {
+		Days int `json:"days"`
+	}
+	if err := decodeJSON(context, &request); err != nil {
+		context.JSON(http.StatusBadRequest, gin.H{"error": "invalid trash retention request"})
+		return
+	}
+	if err := service.SetTrashRetention(context.Request.Context(), identity.Role, context.Param("id"), request.Days); err != nil {
+		context.JSON(http.StatusBadRequest, gin.H{"error": err.Error()})
+		return
+	}
+	context.Status(http.StatusNoContent)
 }
 
 func (service *Service) CreateUser(context *gin.Context) {
@@ -73,6 +129,22 @@ func (service *Service) CreateUser(context *gin.Context) {
 		return
 	}
 	context.JSON(http.StatusCreated, gin.H{"user": account, "provisioningUri": provisioningURI, "qrCode": qrCode})
+}
+
+func (service *Service) ResetUserPassword(context *gin.Context) {
+	identity, _ := currentUser(context)
+	var request struct {
+		Password string `json:"password"`
+	}
+	if err := decodeJSON(context, &request); err != nil {
+		context.JSON(http.StatusBadRequest, gin.H{"error": "invalid password reset request"})
+		return
+	}
+	if err := service.ResetPassword(context.Request.Context(), identity.Role, context.Param("id"), request.Password); err != nil {
+		context.JSON(http.StatusBadRequest, gin.H{"error": err.Error()})
+		return
+	}
+	context.Status(http.StatusNoContent)
 }
 
 func (service *Service) SetMyFolder(context *gin.Context) {
@@ -152,6 +224,22 @@ func (service *Service) DownloadMedia(context *gin.Context) {
 	}
 	context.Header("Content-Disposition", mime.FormatMediaType("attachment", map[string]string{"filename": media.Filename}))
 	context.File(path)
+}
+
+func (service *Service) DownloadThumbnail(context *gin.Context) {
+	identity, _ := currentUser(context)
+	path, err := service.repository.GetAccessibleThumbnailPath(context.Request.Context(), context.Param("id"), identity.ID)
+	if err != nil {
+		context.JSON(http.StatusNotFound, gin.H{"error": "thumbnail not found"})
+		return
+	}
+	resolved, err := service.mediaPath(path)
+	if err != nil {
+		context.JSON(http.StatusNotFound, gin.H{"error": "thumbnail not found"})
+		return
+	}
+	context.Header("Cache-Control", "private, max-age=86400")
+	context.File(resolved)
 }
 
 func (service *Service) mediaPath(relative string) (string, error) {

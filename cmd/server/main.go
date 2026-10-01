@@ -3,8 +3,9 @@ package main
 import (
 	"context"
 	"fmt"
-	"log"
+	"log/slog"
 	"net/http"
+	"net/netip"
 	"os"
 	"os/signal"
 	"strings"
@@ -13,9 +14,15 @@ import (
 
 	"pal-nas-media-uploader/app/auth"
 	"pal-nas-media-uploader/app/autoalbum"
+	"pal-nas-media-uploader/app/batch"
 	store "pal-nas-media-uploader/app/db"
 	"pal-nas-media-uploader/app/gallery"
+	"pal-nas-media-uploader/app/operations"
+	"pal-nas-media-uploader/app/processing"
+	"pal-nas-media-uploader/app/publicshare"
 	setupapp "pal-nas-media-uploader/app/setup"
+	"pal-nas-media-uploader/app/transfer"
+	"pal-nas-media-uploader/app/trash"
 	uploader "pal-nas-media-uploader/app/uploader"
 	userapp "pal-nas-media-uploader/app/user"
 
@@ -30,7 +37,7 @@ var (
 )
 
 type Environment struct {
-	Mode string `env:"ENV_GIN_MODE"`
+	Mode string `env:"ENV_GIN_MODE,default=release"`
 	Port string `env:"ENV_PORT,default=8080"`
 
 	DatabaseURL     string `env:"ENV_DATABASE_URL"`
@@ -42,9 +49,13 @@ type Environment struct {
 	MaxUploadSize   int64  `env:"ENV_MAX_UPLOAD_SIZE_BYTES,default=107374182400"`
 	MaxPendingSize  int64  `env:"ENV_MAX_PENDING_UPLOAD_BYTES_PER_USER,default=107374182400"`
 	MaxStorageSize  int64  `env:"ENV_MAX_STORAGE_BYTES_PER_USER,default=1099511627776"`
+	MinDiskFree     int64  `env:"ENV_MIN_DISK_FREE_BYTES,default=2147483648"`
 	MaxActive       int    `env:"ENV_MAX_ACTIVE_UPLOADS_PER_USER,default=10"`
 	HTTPReadTimeout string `env:"ENV_HTTP_READ_TIMEOUT,default=5m"`
+	CleanupInterval string `env:"ENV_CLEANUP_INTERVAL,default=1h"`
+	UploadRetention string `env:"ENV_UPLOAD_RETENTION,default=168h"`
 	AllowedOrigins  string `env:"ENV_CORS_ALLOWED_ORIGINS,default=http://localhost:3000"`
+	TrustedProxies  string `env:"ENV_TRUSTED_PROXIES"`
 	Issuer          string `env:"ENV_ISSUER,default=issuer.palpaul.com"`
 	AutoAlbumRunAt  string `env:"ENV_AUTO_ALBUM_RUN_AT,default=02:00"`
 	AutoAlbumZone   string `env:"ENV_AUTO_ALBUM_TIMEZONE,default=Local"`
@@ -52,15 +63,18 @@ type Environment struct {
 
 // Initializing environment variables
 func init() {
+	slog.SetDefault(slog.New(slog.NewJSONHandler(os.Stdout, nil)))
 	_, err := env.Unmarshal(&envVar)
 	if err != nil {
-		log.Fatal(err)
+		slog.Error("load environment", "error", err)
+		os.Exit(1)
 	}
 }
 
 func main() {
 	if err := run(); err != nil {
-		log.Fatal(err)
+		slog.Error("application stopped", "error", err)
+		os.Exit(1)
 	}
 }
 
@@ -71,6 +85,18 @@ func run() error {
 	readTimeout, err := time.ParseDuration(envVar.HTTPReadTimeout)
 	if err != nil || readTimeout <= 0 {
 		return fmt.Errorf("ENV_HTTP_READ_TIMEOUT must be a positive duration")
+	}
+	cleanupInterval, err := time.ParseDuration(envVar.CleanupInterval)
+	if err != nil || cleanupInterval <= 0 {
+		return fmt.Errorf("ENV_CLEANUP_INTERVAL must be a positive duration")
+	}
+	uploadRetention, err := time.ParseDuration(envVar.UploadRetention)
+	if err != nil || uploadRetention <= 0 {
+		return fmt.Errorf("ENV_UPLOAD_RETENTION must be a positive duration")
+	}
+	trustedProxies, err := parseTrustedProxies(envVar.TrustedProxies)
+	if err != nil {
+		return err
 	}
 
 	ctx := context.Background()
@@ -83,7 +109,7 @@ func run() error {
 		return err
 	}
 
-	authService := auth.NewService(database, envVar.Issuer)
+	authService := auth.NewService(database, envVar.Issuer, auth.WithTrustedProxies(trustedProxies))
 	frontendPagesEnabled, err := parseYesNo(envVar.FrontendPages)
 	if err != nil {
 		return err
@@ -103,6 +129,7 @@ func run() error {
 		uploader.WithMaxUploadSize(envVar.MaxUploadSize),
 		uploader.WithMaxPendingUploadSize(envVar.MaxPendingSize),
 		uploader.WithMaxUserStorageSize(envVar.MaxStorageSize),
+		uploader.WithMinDiskFree(envVar.MinDiskFree),
 		uploader.WithMaxActiveUploads(envVar.MaxActive),
 		uploader.WithMediaRepository(database),
 	)
@@ -111,29 +138,72 @@ func run() error {
 	}
 	userService := userapp.NewService(database, envVar.Issuer, envVar.MediaDir, userapp.WithFrontendPages(frontendPagesEnabled))
 	galleryService := gallery.NewService(database, envVar.MediaDir)
+	operationsService, err := operations.New(database, uploaderService, envVar.MediaDir, envVar.TmpDir, envVar.MinDiskFree)
+	if err != nil {
+		return fmt.Errorf("create operations service: %w", err)
+	}
+	processingService := processing.New(database, envVar.MediaDir)
+	publicShareService := publicshare.New(database, envVar.MediaDir)
+	trashService := trash.New(database, envVar.MediaDir)
+	batchService := batch.New(database)
+	transferService := transfer.New(database)
 
 	// Setup router
-	router = gin.Default()
+	gin.SetMode(envVar.Mode)
+	router = gin.New()
+	proxyStrings := make([]string, 0, len(trustedProxies))
+	for _, prefix := range trustedProxies {
+		proxyStrings = append(proxyStrings, prefix.String())
+	}
+	if err := router.SetTrustedProxies(proxyStrings); err != nil {
+		return fmt.Errorf("configure trusted proxies: %w", err)
+	}
+	router.Use(gin.Recovery(), requestLoggerMiddleware())
+	router.Use(securityHeadersMiddleware())
 	router.Use(corsMiddleware(envVar.AllowedOrigins))
+	router.GET("/healthz", operationsService.Liveness)
+	router.GET("/readyz", operationsService.Readiness)
 	setupService.RegisterRoutes(router)
 	router.POST("/auth/login", gin.WrapF(authService.Login))
 	router.POST("/auth/verify", gin.WrapF(authService.VerifyTOTP))
+	router.POST("/auth/recovery", gin.WrapF(authService.VerifyRecoveryCodeHandler))
+	router.GET("/public/:token", publicShareService.Resolve)
+	router.GET("/public/:token/download", publicShareService.Download)
 
 	protected := router.Group("/")
 	protected.Use(authService.RequireAuth())
 	protected.GET("/auth/session", gin.WrapF(authService.Session))
 	protected.POST("/auth/logout", gin.WrapF(authService.LogoutHandler))
+	protected.POST("/auth/recovery-codes", authService.RecoveryCodes)
 
 	adminRoutes := protected.Group("/admin")
 	adminRoutes.Use(userService.RequireRole("admin"))
 	adminRoutes.GET("/config", userService.ConfigurationPage)
 	adminRoutes.GET("/users", userService.ListUsers)
 	adminRoutes.POST("/users", userService.CreateUser)
+	adminRoutes.PATCH("/users/:id/password", userService.ResetUserPassword)
+	adminRoutes.PATCH("/users/:id/quota", userService.SetUserQuota)
+	adminRoutes.PATCH("/users/:id/trash-retention", userService.SetUserTrashRetention)
+	adminRoutes.GET("/storage/dashboard", userService.StorageDashboard)
+	adminRoutes.GET("/operations/integrity", operationsService.Integrity)
+	adminRoutes.GET("/processing-jobs", processingService.ListJobs)
+	adminRoutes.POST("/processing-jobs/:id/retry", processingService.RetryJob)
+	adminRoutes.POST("/trash/cleanup", trashService.CleanupHandler)
 
 	userRoutes := protected.Group("/")
 	userRoutes.Use(userService.RequireRole("user"))
 	userRoutes.PUT("/users/me/folder", userService.SetMyFolder)
+	userRoutes.GET("/media/app", userService.MediaPage)
 	userRoutes.GET("/media/files/:id/download", userService.DownloadMedia)
+	userRoutes.GET("/media/files/:id/thumbnail", userService.DownloadThumbnail)
+	userRoutes.POST("/media/public-links", publicShareService.Create)
+	userRoutes.DELETE("/media/public-links/:id", publicShareService.Delete)
+	userRoutes.POST("/media/upload-batches", batchService.Create)
+	userRoutes.GET("/media/upload-batches/:id", batchService.Get)
+	userRoutes.POST("/media/upload-batches/:id/cancel", batchService.Cancel)
+	userRoutes.GET("/media/export", transferService.Export)
+	userRoutes.POST("/media/import", transferService.Import)
+	userRoutes.GET("/media/files/:id/processing-status", processingService.Status)
 	userRoutes.POST("/media/files/:id/shares", userService.ShareMedia)
 	userRoutes.DELETE("/media/files/:id/shares", userService.UnshareMedia)
 	gallery.RegisterRoutes(userRoutes, galleryService)
@@ -143,10 +213,14 @@ func run() error {
 
 	schedulerCtx, stopScheduler := context.WithCancel(context.Background())
 	defer stopScheduler()
+	go processingService.Run(schedulerCtx)
+	go trashService.Run(schedulerCtx)
 	go autoAlbumService.RunScheduled(schedulerCtx, autoAlbumSchedule, func(err error) {
-		log.Printf("automatic album reconciliation failed: %v", err)
+		slog.Error("automatic album reconciliation failed", "error", err)
 	})
-	log.Printf("automatic albums scheduled for %s in %s", envVar.AutoAlbumRunAt, autoAlbumSchedule.Location)
+	slog.Info("automatic albums scheduled", "runAt", envVar.AutoAlbumRunAt, "timezone", autoAlbumSchedule.Location.String())
+	go runCleanup(schedulerCtx, operationsService, cleanupInterval, uploadRetention)
+	go reportStartupIntegrity(schedulerCtx, operationsService)
 
 	// Graceful shutdown
 	srv := &http.Server{
@@ -169,8 +243,7 @@ func run() error {
 		}
 	}()
 
-	log.Println("server started successfully")
-	log.Println("press Ctrl+C to stop")
+	slog.Info("server started", "port", envVar.Port)
 
 	select {
 	case err := <-serverErrors:
@@ -178,7 +251,7 @@ func run() error {
 	case <-quit:
 	}
 	stopScheduler()
-	log.Println("shutting down server...")
+	slog.Info("shutting down server")
 
 	// Graceful shutdown with timeout
 	shutdownCtx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
@@ -189,8 +262,47 @@ func run() error {
 		return fmt.Errorf("server forced to shutdown: %w", shutdownErr)
 	}
 
-	log.Println("server stopped gracefully")
+	slog.Info("server stopped gracefully")
 	return nil
+}
+
+func reportStartupIntegrity(ctx context.Context, service *operations.Service) {
+	report, err := service.ScanIntegrity(ctx)
+	if err != nil {
+		slog.Error("startup integrity scan failed", "error", err)
+		return
+	}
+	if len(report.FilesWithoutRecords) > 0 || len(report.RecordsWithoutFiles) > 0 {
+		slog.Warn("startup integrity issues found",
+			"filesWithoutRecords", len(report.FilesWithoutRecords),
+			"recordsWithoutFiles", len(report.RecordsWithoutFiles))
+		return
+	}
+	slog.Info("startup integrity scan completed")
+}
+
+func runCleanup(ctx context.Context, service *operations.Service, interval, uploadRetention time.Duration) {
+	run := func() {
+		result, err := service.Cleanup(ctx, time.Now(), uploadRetention)
+		if err != nil {
+			slog.Error("scheduled cleanup failed", "error", err)
+			return
+		}
+		if result.AuthRecords > 0 || result.Uploads > 0 {
+			slog.Info("scheduled cleanup completed", "authRecords", result.AuthRecords, "uploads", result.Uploads)
+		}
+	}
+	run()
+	ticker := time.NewTicker(interval)
+	defer ticker.Stop()
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case <-ticker.C:
+			run()
+		}
+	}
 }
 
 func parseYesNo(value string) (bool, error) {
@@ -201,6 +313,51 @@ func parseYesNo(value string) (bool, error) {
 		return false, nil
 	default:
 		return false, fmt.Errorf("ENV_FRONTEND_PAGES_ENABLED must be YES or NO")
+	}
+}
+
+func parseTrustedProxies(value string) ([]netip.Prefix, error) {
+	var prefixes []netip.Prefix
+	for _, item := range strings.Split(value, ",") {
+		item = strings.TrimSpace(item)
+		if item == "" {
+			continue
+		}
+		prefix, err := netip.ParsePrefix(item)
+		if err != nil {
+			address, addressErr := netip.ParseAddr(item)
+			if addressErr != nil {
+				return nil, fmt.Errorf("ENV_TRUSTED_PROXIES contains invalid address %q", item)
+			}
+			prefix = netip.PrefixFrom(address, address.BitLen())
+		}
+		prefixes = append(prefixes, prefix)
+	}
+	return prefixes, nil
+}
+
+func securityHeadersMiddleware() gin.HandlerFunc {
+	return func(context *gin.Context) {
+		context.Header("X-Content-Type-Options", "nosniff")
+		context.Header("X-Frame-Options", "DENY")
+		context.Header("Referrer-Policy", "no-referrer")
+		context.Header("Permissions-Policy", "camera=(), microphone=(), geolocation=()")
+		context.Next()
+	}
+}
+
+func requestLoggerMiddleware() gin.HandlerFunc {
+	return func(context *gin.Context) {
+		started := time.Now()
+		context.Next()
+		slog.Info("http request",
+			"method", context.Request.Method,
+			"path", context.Request.URL.Path,
+			"status", context.Writer.Status(),
+			"durationMs", time.Since(started).Milliseconds(),
+			"clientIP", context.ClientIP(),
+			"errors", len(context.Errors),
+		)
 	}
 }
 

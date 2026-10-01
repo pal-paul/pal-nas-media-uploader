@@ -23,6 +23,8 @@ func NewPostgres(ctx context.Context, databaseURL string) (*Postgres, error) {
 
 func (store *Postgres) Close() { store.pool.Close() }
 
+func (store *Postgres) Ping(ctx context.Context) error { return store.pool.Ping(ctx) }
+
 func (store *Postgres) Migrate(ctx context.Context) error {
 	_, err := store.pool.Exec(ctx, schema)
 	if err != nil {
@@ -45,6 +47,8 @@ CREATE TABLE IF NOT EXISTS users (
 ALTER TABLE users ADD COLUMN IF NOT EXISTS role TEXT NOT NULL DEFAULT 'admin';
 ALTER TABLE users ADD COLUMN IF NOT EXISTS upload_folder TEXT;
 ALTER TABLE users ADD COLUMN IF NOT EXISTS totp_required BOOLEAN NOT NULL DEFAULT FALSE;
+ALTER TABLE users ADD COLUMN IF NOT EXISTS storage_quota_bytes BIGINT CHECK (storage_quota_bytes > 0);
+ALTER TABLE users ADD COLUMN IF NOT EXISTS trash_retention_days INTEGER NOT NULL DEFAULT 30 CHECK (trash_retention_days BETWEEN 1 AND 3650);
 UPDATE users SET totp_required = TRUE WHERE role = 'admin' AND totp_required = FALSE;
 CREATE TABLE IF NOT EXISTS auth_challenges (
 	token_hash TEXT PRIMARY KEY,
@@ -60,6 +64,22 @@ CREATE TABLE IF NOT EXISTS auth_sessions (
 	created_at TIMESTAMPTZ NOT NULL DEFAULT now()
 );
 CREATE INDEX IF NOT EXISTS auth_sessions_expires_at_idx ON auth_sessions(expires_at);
+CREATE TABLE IF NOT EXISTS upload_batches (
+	id UUID PRIMARY KEY,
+	owner_id UUID NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+	name TEXT NOT NULL DEFAULT '',
+	expected_files INTEGER NOT NULL CHECK (expected_files > 0),
+	expected_bytes BIGINT NOT NULL CHECK (expected_bytes > 0),
+	status TEXT NOT NULL DEFAULT 'active' CHECK (status IN ('active', 'canceled')),
+	created_at TIMESTAMPTZ NOT NULL DEFAULT now()
+);
+CREATE TABLE IF NOT EXISTS totp_recovery_codes (
+	user_id UUID NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+	code_hash TEXT NOT NULL,
+	used_at TIMESTAMPTZ,
+	created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+	PRIMARY KEY (user_id, code_hash)
+);
 CREATE TABLE IF NOT EXISTS media_uploads (
 	upload_id TEXT PRIMARY KEY,
 	owner_id UUID REFERENCES users(id) ON DELETE CASCADE,
@@ -72,7 +92,31 @@ CREATE TABLE IF NOT EXISTS media_uploads (
 );
 ALTER TABLE media_uploads ADD COLUMN IF NOT EXISTS owner_id UUID REFERENCES users(id) ON DELETE CASCADE;
 ALTER TABLE media_uploads ADD COLUMN IF NOT EXISTS deleted_at TIMESTAMPTZ;
+ALTER TABLE media_uploads ADD COLUMN IF NOT EXISTS thumbnail_path TEXT;
+ALTER TABLE media_uploads ADD COLUMN IF NOT EXISTS width INTEGER;
+ALTER TABLE media_uploads ADD COLUMN IF NOT EXISTS height INTEGER;
+ALTER TABLE media_uploads ADD COLUMN IF NOT EXISTS video_duration_seconds DOUBLE PRECISION;
+ALTER TABLE media_uploads ADD COLUMN IF NOT EXISTS batch_id UUID REFERENCES upload_batches(id) ON DELETE SET NULL;
 CREATE INDEX IF NOT EXISTS media_uploads_owner_id_idx ON media_uploads(owner_id);
+CREATE INDEX IF NOT EXISTS media_uploads_deleted_at_idx ON media_uploads(deleted_at) WHERE deleted_at IS NOT NULL;
+CREATE TABLE IF NOT EXISTS media_processing_jobs (
+	id TEXT PRIMARY KEY,
+	upload_id TEXT NOT NULL UNIQUE REFERENCES media_uploads(upload_id) ON DELETE CASCADE,
+	status TEXT NOT NULL DEFAULT 'queued' CHECK (status IN ('queued', 'processing', 'completed', 'failed')),
+	attempts INTEGER NOT NULL DEFAULT 0,
+	last_error TEXT,
+	scheduled_for TIMESTAMPTZ NOT NULL DEFAULT now(),
+	created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+	updated_at TIMESTAMPTZ NOT NULL DEFAULT now()
+);
+CREATE INDEX IF NOT EXISTS media_processing_jobs_queue_idx ON media_processing_jobs(status, scheduled_for);
+CREATE TABLE IF NOT EXISTS media_exif (
+	upload_id TEXT PRIMARY KEY REFERENCES media_uploads(upload_id) ON DELETE CASCADE,
+	captured_at TIMESTAMPTZ,
+	latitude DOUBLE PRECISION,
+	longitude DOUBLE PRECISION,
+	raw_exif JSONB NOT NULL DEFAULT '{}'::jsonb
+);
 CREATE TABLE IF NOT EXISTS media_shares (
 	upload_id TEXT NOT NULL REFERENCES media_uploads(upload_id) ON DELETE CASCADE,
 	user_id UUID NOT NULL REFERENCES users(id) ON DELETE CASCADE,
@@ -108,6 +152,27 @@ ALTER TABLE albums ADD COLUMN IF NOT EXISTS automatic BOOLEAN NOT NULL DEFAULT F
 ALTER TABLE albums ADD COLUMN IF NOT EXISTS auto_key TEXT;
 CREATE INDEX IF NOT EXISTS albums_owner_position_idx ON albums(owner_id, position, created_at DESC);
 CREATE UNIQUE INDEX IF NOT EXISTS albums_owner_auto_key_idx ON albums(owner_id, auto_key) WHERE auto_key IS NOT NULL;
+CREATE TABLE IF NOT EXISTS import_sessions (
+	id UUID PRIMARY KEY,
+	owner_id UUID NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+	status TEXT NOT NULL CHECK (status IN ('processing', 'completed', 'failed')),
+	imported_items INTEGER NOT NULL DEFAULT 0,
+	error_message TEXT,
+	created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+	updated_at TIMESTAMPTZ NOT NULL DEFAULT now()
+);
+CREATE TABLE IF NOT EXISTS public_shares (
+	id TEXT PRIMARY KEY,
+	owner_id UUID NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+	media_id TEXT REFERENCES media_uploads(upload_id) ON DELETE CASCADE,
+	album_id UUID REFERENCES albums(id) ON DELETE CASCADE,
+	password_hash TEXT,
+	expires_at TIMESTAMPTZ NOT NULL,
+	access_count BIGINT NOT NULL DEFAULT 0,
+	created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+	CHECK ((media_id IS NULL) <> (album_id IS NULL))
+);
+CREATE INDEX IF NOT EXISTS public_shares_expires_at_idx ON public_shares(expires_at);
 CREATE TABLE IF NOT EXISTS album_media (
 	album_id UUID NOT NULL REFERENCES albums(id) ON DELETE CASCADE,
 	upload_id TEXT NOT NULL REFERENCES media_uploads(upload_id) ON DELETE CASCADE,
