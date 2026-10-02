@@ -6,25 +6,33 @@ import (
 	"os"
 	"path/filepath"
 	"sync"
+	"time"
 
 	"github.com/gin-gonic/gin"
 )
 
 type service struct {
-	tmpDir        string
-	mediaDir      string
-	maxUploadSize int64
-	mediaStore    MediaRepository
-	uploads       map[string]*uploadSession
-	uploadMux     sync.RWMutex
+	tmpDir         string
+	mediaDir       string
+	maxUploadSize  int64
+	maxPendingSize int64
+	maxStorageSize int64
+	minDiskFree    int64
+	maxActive      int
+	diskFree       func(string) (int64, error)
+	mediaStore     MediaRepository
+	uploads        map[string]*uploadSession
+	uploadMux      sync.RWMutex
 }
 
 type IUploaderService interface {
+	HandleCheckDuplicate(context *gin.Context)
 	HandleCreateUpload(context *gin.Context)
 	HandleUploadPart(context *gin.Context)
 	HandleCompleteUpload(context *gin.Context)
 	HandleGetUploadStatus(context *gin.Context)
 	HandleDeleteUpload(context *gin.Context)
+	CleanupExpiredUploads(time.Time, time.Duration) (int, error)
 }
 
 type Option func(*service) error
@@ -35,6 +43,56 @@ func WithMaxUploadSize(size int64) Option {
 			return fmt.Errorf("maximum upload size must be positive")
 		}
 		service.maxUploadSize = size
+		return nil
+	}
+}
+
+func WithMaxPendingUploadSize(size int64) Option {
+	return func(service *service) error {
+		if size <= 0 {
+			return fmt.Errorf("maximum pending upload size must be positive")
+		}
+		service.maxPendingSize = size
+		return nil
+	}
+}
+
+func WithMaxUserStorageSize(size int64) Option {
+	return func(service *service) error {
+		if size <= 0 {
+			return fmt.Errorf("maximum user storage size must be positive")
+		}
+		service.maxStorageSize = size
+		return nil
+	}
+}
+
+func WithMaxActiveUploads(count int) Option {
+	return func(service *service) error {
+		if count <= 0 {
+			return fmt.Errorf("maximum active uploads must be positive")
+		}
+		service.maxActive = count
+		return nil
+	}
+}
+
+func WithMinDiskFree(size int64) Option {
+	return func(service *service) error {
+		if size < 0 {
+			return fmt.Errorf("minimum disk free size cannot be negative")
+		}
+		service.minDiskFree = size
+		return nil
+	}
+}
+
+func withDiskFree(check func(string) (int64, error)) Option {
+	return func(service *service) error {
+		if check == nil {
+			return fmt.Errorf("disk free check is required")
+		}
+		service.diskFree = check
 		return nil
 	}
 }
@@ -55,10 +113,15 @@ func New(tmpDir string, mediaDir string, options ...Option) (IUploaderService, e
 	}
 
 	service := &service{
-		tmpDir:        filepath.Clean(tmpDir),
-		mediaDir:      filepath.Clean(mediaDir),
-		maxUploadSize: defaultMaxUploadSize,
-		uploads:       make(map[string]*uploadSession),
+		tmpDir:         filepath.Clean(tmpDir),
+		mediaDir:       filepath.Clean(mediaDir),
+		maxUploadSize:  defaultMaxUploadSize,
+		maxPendingSize: defaultMaxPendingSize,
+		maxStorageSize: defaultMaxStorageSize,
+		minDiskFree:    defaultMinDiskFree,
+		maxActive:      defaultMaxActive,
+		diskFree:       availableDiskBytes,
+		uploads:        make(map[string]*uploadSession),
 	}
 	for _, option := range options {
 		if err := option(service); err != nil {
@@ -141,4 +204,45 @@ func (s *service) writeMetadata(upload *Upload) error {
 	}
 	removeTemporary = false
 	return nil
+}
+
+func (s *service) CleanupExpiredUploads(now time.Time, maxAge time.Duration) (int, error) {
+	if maxAge <= 0 {
+		return 0, fmt.Errorf("upload retention must be positive")
+	}
+	s.uploadMux.RLock()
+	sessions := make(map[string]*uploadSession, len(s.uploads))
+	for id, session := range s.uploads {
+		sessions[id] = session
+	}
+	s.uploadMux.RUnlock()
+
+	removed := 0
+	cutoff := now.Add(-maxAge)
+	for id, session := range sessions {
+		session.mutex.Lock()
+		dir := filepath.Join(s.tmpDir, id)
+		info, err := os.Stat(dir)
+		if err != nil && !os.IsNotExist(err) {
+			session.mutex.Unlock()
+			return removed, fmt.Errorf("stat upload %q: %w", id, err)
+		}
+		if session.deleted || err == nil && !info.ModTime().Before(cutoff) {
+			session.mutex.Unlock()
+			continue
+		}
+		if err := os.RemoveAll(dir); err != nil {
+			session.mutex.Unlock()
+			return removed, fmt.Errorf("remove expired upload %q: %w", id, err)
+		}
+		session.deleted = true
+		s.uploadMux.Lock()
+		if s.uploads[id] == session {
+			delete(s.uploads, id)
+			removed++
+		}
+		s.uploadMux.Unlock()
+		session.mutex.Unlock()
+	}
+	return removed, nil
 }

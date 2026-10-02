@@ -14,6 +14,11 @@ services:
       interval: ${POSTGRES_HEALTH_INTERVAL}
       timeout: ${POSTGRES_HEALTH_TIMEOUT}
       retries: ${POSTGRES_HEALTH_RETRIES}
+    logging:
+      driver: json-file
+      options:
+        max-size: ${LOG_MAX_SIZE}
+        max-file: "${LOG_MAX_FILES}"
 
   uploader:
     image: ${UPLOADER_IMAGE}
@@ -22,6 +27,7 @@ services:
       dockerfile: ${DOCKERFILE_PATH}
       args:
         GO_IMAGE: ${GO_IMAGE}
+        NODE_IMAGE: ${NODE_IMAGE:-node:24-alpine}
         RUNTIME_IMAGE: ${RUNTIME_IMAGE}
         ENV_MEDIA_DIR: ${ENV_MEDIA_DIR}
         ENV_TMP_DIR: ${ENV_TMP_DIR}
@@ -36,6 +42,17 @@ services:
     depends_on:
       postgres:
         condition: service_healthy
+    healthcheck:
+      test: ["CMD", "wget", "-q", "-O", "/dev/null", "http://127.0.0.1:${ENV_PORT}/readyz"]
+      interval: 30s
+      timeout: 5s
+      start_period: 15s
+      retries: 3
+    logging:
+      driver: json-file
+      options:
+        max-size: ${LOG_MAX_SIZE}
+        max-file: "${LOG_MAX_FILES}"
     restart: ${COMPOSE_RESTART_POLICY}
 
 volumes:

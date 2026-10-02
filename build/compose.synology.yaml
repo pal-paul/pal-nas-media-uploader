@@ -1,0 +1,9 @@
+services:
+  postgres:
+    volumes:
+      - ${NAS_POSTGRES_PATH}:${POSTGRES_DATA_DIR}
+
+  uploader:
+    volumes:
+      - ${NAS_MEDIA_PATH}:${ENV_MEDIA_DIR}
+      - ${NAS_UPLOAD_TMP_PATH}:${ENV_TMP_DIR}

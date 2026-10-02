@@ -3,9 +3,82 @@ info:
   title: PAL NAS Media Uploader API
   version: 1.0.0
   description: |
-    Authenticated, resumable media uploads with TOTP enrollment and login.
-    Upload parts are zero-indexed and must be sent in fixed 8 MiB chunks,
-    except for the final part.
+    Backend API for a self-hosted, multi-user NAS media library.
+
+    ## Accounts and authorization
+
+    The service has two roles. Administrators manage accounts but cannot use
+    upload or gallery routes. Regular users upload into their configured folder,
+    organize accessible media, and share owned media with other regular users.
+    Resource lookup is scoped by the authenticated identity; inaccessible
+    resources generally return `404` instead of revealing their existence.
+
+    The first persistent administrator is created through the one-time HTML
+    setup flow. Deployment bootstrap credentials authorize that operation only
+    and are never stored as an application account. The initial administrator
+    enrolls TOTP on first login. Every account subsequently created by an
+    administrator also uses password plus TOTP.
+
+    ## Sessions and browser access
+
+    Authentication produces an opaque, HttpOnly cookie named
+    `pal_medias_uploader_session`. Sessions last 30 days. Cross-origin browser
+    requests must send credentials and their `Origin` must appear in
+    `ENV_CORS_ALLOWED_ORIGINS`; an unlisted origin receives an empty `403`
+    response. The cookie is `Secure` for HTTPS requests and uses `SameSite=None`
+    only for secure cross-site requests; otherwise it uses `SameSite=Strict`.
+
+    ## Uploads and media
+
+    Upload sessions belong to the user who created them. Parts are zero-indexed
+    and use a fixed 8 MiB size except for the final part. Active upload metadata
+    and parts are persisted under the temporary directory and are reloaded after
+    a process restart. Abandoned uploads expire after the configured retention period. Completion assembles
+    parts in order, computes SHA-256, optionally verifies the client checksum,
+    atomically moves the file into media storage, and persists the media record.
+
+    Completed media have one owner. Sharing creates an owner-to-recipient library
+    grant: the recipient can access all of that owner's current and future active
+    media for listing, download, album membership, favorites, storage totals, and
+    automatic albums. Sharing never transfers ownership. Favorites are per-user.
+    Trashing is owner-only and immediately hides media from recipients; permanent
+    deletion stages the physical file and generated thumbnail, removes associated
+    database rows, and then removes the staged files. Public album links never
+    expose media owned by another user.
+
+    ## Albums
+
+    Manual albums are user-owned and may contain owned or shared active media.
+    Nightly reconciliation creates system-managed weekly albums from each user's
+    complete accessible library, including media received through library shares.
+    Dates with more than 15 accessible active items are promoted to a daily album.
+    The same media can therefore appear in automatic albums owned by its owner and
+    by each recipient. Automatic albums cannot be renamed, deleted, reordered, or
+    have membership changed manually.
+
+    ## Runtime configuration
+
+    The backend is configured through environment variables:
+
+    - `ENV_DATABASE_URL` is the required PostgreSQL connection URL.
+    - `ENV_ADMIN_USERNAME` and `ENV_ADMIN_PASSWORD` authorize one-time setup;
+      the bootstrap password must contain at least 12 characters.
+    - `ENV_ADMIN_CONFIG` is `YES` or `NO` and controls only the administrator
+      account page at `/admin/config`. Setup, gallery, and JSON APIs remain active.
+    - `ENV_WEB_DIR` selects the gallery production build and defaults to
+      `./web/dist`.
+    - `ENV_MEDIA_DIR` and `ENV_TMP_DIR` select completed-media and active-upload
+      storage roots.
+    - `ENV_MAX_UPLOAD_SIZE_BYTES` defaults to 100 GiB.
+    - `ENV_CORS_ALLOWED_ORIGINS` is a comma-separated exact-origin allowlist.
+    - `ENV_ISSUER` is displayed by authenticator applications.
+    - `ENV_AUTO_ALBUM_RUN_AT` defaults to `02:00`; `ENV_AUTO_ALBUM_TIMEZONE`
+      accepts an IANA timezone and defaults to the host's local timezone.
+
+    PostgreSQL stores users, sessions, challenges, completed-media metadata,
+    sharing, albums, and preferences. Active upload chunks and their recovery
+    metadata are filesystem-backed. Completed files are stored beneath the
+    configured media root.
 servers:
   - url: http://localhost:{port}
     description: Local Docker Compose environment
@@ -13,22 +86,176 @@ servers:
       port:
         default: "8081"
 tags:
+  - name: Setup
+    description: One-time, bootstrap-authorized creation of the first administrator.
   - name: Authentication
-    description: Password, TOTP enrollment, sessions, and logout.
+    description: Password verification, TOTP challenges, opaque sessions, and logout.
   - name: Uploads
-    description: Resumable chunk upload creation, transfer, status, completion, and cancellation.
+    description: User-owned resumable upload creation, part transfer, recovery, completion, and cancellation.
+  - name: Users
+    description: Administrator-only account configuration and regular-user folder management.
+  - name: Media
+    description: Owned and shared completed media, downloads, and owner-managed sharing.
+  - name: Gallery
+    description: User-owned albums, personal favorites, trash, and accessible storage totals.
+  - name: Operations
+    description: Container health, readiness, and administrator integrity checks.
+  - name: Processing
+    description: Durable thumbnail and metadata processing jobs.
+  - name: Public Sharing
+    description: Expiring, optionally password-protected media and album links.
+  - name: Transfer
+    description: Versioned album and media metadata import and export.
 security:
   - sessionCookie: []
 paths:
+  /healthz:
+    get:
+      tags: [Operations]
+      operationId: liveness
+      summary: Check process liveness
+      security: []
+      responses:
+        "200":
+          description: The HTTP process is running.
+        "403":
+          description: The request supplied an Origin outside the configured allowlist.
+  /readyz:
+    get:
+      tags: [Operations]
+      operationId: readiness
+      summary: Check database and storage readiness
+      security: []
+      responses:
+        "200":
+          description: Database and both storage roots are ready.
+        "403":
+          description: The request supplied an Origin outside the configured allowlist.
+        "503":
+          description: Database connectivity or filesystem reserve check failed.
+  /admin/operations/integrity:
+    get:
+      tags: [Operations]
+      operationId: scanIntegrity
+      summary: Compare media records with filesystem files
+      responses:
+        "200":
+          description: Integrity report.
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [filesWithoutRecords, recordsWithoutFiles, checkedAt]
+                properties:
+                  filesWithoutRecords:
+                    type: array
+                    items: { type: string }
+                  recordsWithoutFiles:
+                    type: array
+                    items: { type: string }
+                  checkedAt:
+                    type: string
+                    format: date-time
+        "403":
+          description: Administrator role required.
+        "500":
+          description: Integrity scan failed.
+  /setup:
+    get:
+      tags: [Setup]
+      operationId: initialSetupPage
+      summary: Open one-time administrator setup
+      description: |
+        Renders an embedded HTML form. The route is available only while the
+        users table is empty. It returns `404` after any account exists, so setup
+        completion requires no separate state flag.
+      security: []
+      responses:
+        "200":
+          description: Initial administrator setup HTML page.
+          content:
+            text/html:
+              schema:
+                type: string
+        "404":
+          description: Setup is complete or frontend pages are disabled.
+    post:
+      tags: [Setup]
+      operationId: createInitialAdministrator
+      summary: Create the first persistent administrator
+      description: |
+        Accepts a form body of at most 64 KiB. Bootstrap credentials are compared
+        with `ENV_ADMIN_USERNAME` and `ENV_ADMIN_PASSWORD` and authorize this
+        operation only; they are never persisted and cannot be used at
+        `/auth/login`.
+
+        Creation is serialized in PostgreSQL and succeeds only while no users
+        exist, preventing concurrent requests from creating multiple initial
+        administrators. The selected password is bcrypt-hashed. The resulting
+        account has role `admin`, an empty upload folder, and enrolls TOTP on
+        first login. Usernames are trimmed and remain case-sensitive.
+      security: []
+      requestBody:
+        required: true
+        content:
+          application/x-www-form-urlencoded:
+            schema:
+              type: object
+              required: [bootstrapUsername, bootstrapPassword, username, password, confirmPassword]
+              properties:
+                bootstrapUsername:
+                  type: string
+                  minLength: 1
+                  description: Deployment bootstrap username configured by the server.
+                bootstrapPassword:
+                  type: string
+                  format: password
+                  minLength: 1
+                  description: Deployment bootstrap password; it is never stored in PostgreSQL.
+                username:
+                  type: string
+                  minLength: 1
+                  description: Permanent, case-sensitive administrator username. Surrounding whitespace is removed.
+                password:
+                  type: string
+                  format: password
+                  minLength: 12
+                confirmPassword:
+                  type: string
+                  format: password
+                  minLength: 12
+                  description: Must exactly match `password`.
+      responses:
+        "201":
+          description: Administrator created; setup HTML confirms completion.
+          content:
+            text/html:
+              schema:
+                type: string
+        "400":
+          description: Invalid form values.
+        "401":
+          description: Invalid bootstrap credentials.
+        "404":
+          description: Setup is complete or frontend pages are disabled.
+        "500":
+          description: The administrator could not be hashed or persisted. The HTML response contains a generic error.
   /auth/login:
     post:
       tags: [Authentication]
       operationId: beginLogin
-      summary: Begin password and TOTP login
+      summary: Log in with a password and optional TOTP
       description: |
-        Validates the username and password and creates a challenge valid for
-        five minutes. When TOTP has not been configured, the response also
-        includes enrollment details.
+        Accepts a JSON body of at most 1 MiB and rejects unknown fields. The
+        username is trimmed and matched case-sensitively; the password is checked
+        with bcrypt.
+
+        The initial configured administrator receives a session cookie
+        immediately and the response contains `authenticated: true`. Every
+        subsequently created account receives an opaque challenge valid for five
+        minutes. Managed accounts receive their TOTP provisioning URI when an
+        administrator creates them. The login response exposes provisioning data
+        only if an account has a pending, not-yet-active TOTP secret.
       security: []
       requestBody:
         required: true
@@ -38,17 +265,39 @@ paths:
               $ref: "#/components/schemas/LoginRequest"
       responses:
         "200":
-          description: Login challenge created.
+          description: A TOTP challenge was created, or the initial administrator was authenticated immediately.
+          headers:
+            Set-Cookie:
+              description: Set immediately for accounts exempt from TOTP.
+              schema:
+                type: string
           content:
             application/json:
               schema:
                 $ref: "#/components/schemas/LoginChallenge"
+              examples:
+                initialAdministrator:
+                  summary: Password-only initial administrator
+                  value:
+                    authenticated: true
+                totpChallenge:
+                  summary: Existing TOTP-enabled account
+                  value:
+                    challengeToken: opaque-challenge-token
+                enrollmentChallenge:
+                  summary: First login for a managed account
+                  value:
+                    challengeToken: opaque-challenge-token
+                    provisioningUri: otpauth://totp/PAL:user
+                    secret: JBSWY3DPEHPK3PXP
         "400":
           $ref: "#/components/responses/BadRequest"
         "401":
           $ref: "#/components/responses/Unauthorized"
         "403":
           $ref: "#/components/responses/ForbiddenOrigin"
+        "409":
+          $ref: "#/components/responses/UploadConflict"
         "500":
           $ref: "#/components/responses/InternalServerError"
   /auth/verify:
@@ -57,9 +306,14 @@ paths:
       operationId: verifyTOTP
       summary: Verify TOTP and create a session
       description: |
-        Validates the challenge and six-digit TOTP code. For first-time login,
-        this also enables the pending TOTP secret. A successful response sets
-        an HttpOnly session cookie valid for 30 days.
+        Validates an unexpired challenge and a six-digit TOTP code. TOTP uses a
+        30-second period, SHA-1, six digits, and accepts one adjacent time step in
+        either direction. For first-time login, successful verification promotes
+        the pending secret to the account's active secret. The challenge is then
+        deleted and cannot be reused.
+
+        A successful response creates a server-side session valid for 30 days
+        and sets the opaque HttpOnly session cookie.
       security: []
       requestBody:
         required: true
@@ -92,6 +346,7 @@ paths:
       tags: [Authentication]
       operationId: getSession
       summary: Get the current session
+      description: Resolves the opaque session cookie and returns the current account. Expired, missing, or unknown sessions receive `401`.
       responses:
         "200":
           description: Current authenticated user.
@@ -108,6 +363,7 @@ paths:
       tags: [Authentication]
       operationId: logout
       summary: Delete the current session
+      description: Requires a valid session, deletes it from the server, and expires the browser cookie. Reusing the deleted cookie receives `401`.
       responses:
         "204":
           description: Session deleted and cookie expired.
@@ -120,14 +376,539 @@ paths:
           $ref: "#/components/responses/Unauthorized"
         "403":
           $ref: "#/components/responses/ForbiddenOrigin"
+  /admin/config:
+    get:
+      tags: [Users]
+      operationId: userConfigurationPage
+      summary: Open the administrator configuration page
+      description: Requires an administrator session and `ENV_ADMIN_CONFIG=YES`. The embedded HTML page calls `/admin/users`; disabling the page does not disable those JSON endpoints.
+      responses:
+        "200":
+          description: User configuration HTML page.
+          content:
+            text/html:
+              schema:
+                type: string
+        "403":
+          $ref: "#/components/responses/Forbidden"
+        "404":
+          description: Administrator configuration page is disabled.
+  /admin/users:
+    get:
+      tags: [Users]
+      operationId: listUsers
+      summary: List users
+      description: Returns every configured account ordered by username. `totpEnabled` reflects whether an active TOTP secret is stored.
+      responses:
+        "200":
+          description: All configured users.
+          content:
+            application/json:
+              schema:
+                type: array
+                items:
+                  $ref: "#/components/schemas/User"
+        "403":
+          $ref: "#/components/responses/Forbidden"
+    post:
+      tags: [Users]
+      operationId: createUser
+      summary: Create a TOTP-enabled user
+      description: |
+        Accepts a JSON body of at most 1 MiB and rejects unknown fields. The
+        username is trimmed and case-sensitive. Roles are trimmed and normalized
+        to lowercase. Passwords are bcrypt-hashed.
+
+        A regular user requires a non-empty relative upload folder. Nested paths
+        such as `family/alice` are allowed, while absolute paths and parent
+        traversal are rejected. Administrator folders are always cleared.
+
+        The service generates a TOTP secret for every managed account, including
+        additional administrators. The provisioning URI and PNG data URI are
+        returned only in this creation response and should be delivered securely.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/CreateUserRequest"
+      responses:
+        "201":
+          description: User created. The TOTP QR code is shown only in this response.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/CreateUserResponse"
+        "400":
+          $ref: "#/components/responses/BadRequest"
+        "403":
+          $ref: "#/components/responses/Forbidden"
+  /users/me/folder:
+    put:
+      tags: [Users]
+      operationId: setMyUploadFolder
+      summary: Set the current regular user's upload folder
+      description: |
+        Available only to role `user`. The folder is trimmed, cleaned, and stored
+        with forward slashes. It must be non-empty and relative, and cannot be
+        `..` or begin with `../`. Changing it affects the destination of future
+        completed uploads; it does not move existing media.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              additionalProperties: false
+              required: [uploadFolder]
+              properties:
+                uploadFolder:
+                  type: string
+                  examples: [family/alice]
+      responses:
+        "204":
+          description: Folder updated.
+        "400":
+          $ref: "#/components/responses/BadRequest"
+        "403":
+          $ref: "#/components/responses/Forbidden"
+  /albums:
+    get:
+      tags: [Gallery]
+      operationId: listAlbums
+      summary: List the current user's albums
+      description: |
+        Returns only albums owned by the current user. Item counts include media
+        that is still accessible and not trashed. Results are ordered by manual
+        position and then newest creation time. Automatic albums without a
+        manual position therefore remain ordered by creation time.
+      parameters:
+        - name: search
+          in: query
+          description: Case-insensitive substring search across album title, description, and member filenames.
+          schema:
+            type: string
+      responses:
+        "200":
+          description: User-owned albums containing currently accessible media.
+          content:
+            application/json:
+              schema:
+                type: array
+                items:
+                  $ref: "#/components/schemas/Album"
+        "403":
+          $ref: "#/components/responses/Forbidden"
+    post:
+      tags: [Gallery]
+      operationId: createAlbum
+      summary: Create an album owned by the current user
+      description: Creates a manual album. The title and description are trimmed; a blank title is rejected.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/AlbumInput"
+      responses:
+        "201":
+          description: Album created.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Album"
+        "400":
+          $ref: "#/components/responses/BadRequest"
+  /albums/order:
+    patch:
+      tags: [Gallery]
+      operationId: reorderAlbums
+      summary: Set the current user's album display order
+      description: |
+        Assigns sequential display positions to the listed manual albums in one
+        transaction. Every listed album must belong to the current user.
+        Automatic albums cannot be reordered. A failure leaves all positions
+        unchanged.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              additionalProperties: false
+              required: [albumIds]
+              properties:
+                albumIds:
+                  type: array
+                  description: Manual album UUIDs in the desired relative order.
+                  items:
+                    type: string
+                    format: uuid
+      responses:
+        "204":
+          description: Album order updated.
+        "404":
+          $ref: "#/components/responses/ResourceNotFound"
+  /albums/{albumId}:
+    parameters:
+      - $ref: "#/components/parameters/AlbumID"
+    get:
+      tags: [Gallery]
+      operationId: getAlbum
+      summary: Get an owned album and its currently accessible media
+      description: |
+        Returns an album owned by the current user and its active media. Shared
+        media disappears from this response when the owner removes the share or
+        trashes the item. An album owned by another user is reported as `404`.
+      responses:
+        "200":
+          description: Album detail.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Album"
+        "404":
+          $ref: "#/components/responses/ResourceNotFound"
+    patch:
+      tags: [Gallery]
+      operationId: updateAlbum
+      summary: Update an owned album
+      description: Updates the trimmed title and description of a manual album. Automatic albums are system-managed and cannot be updated.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/AlbumInput"
+      responses:
+        "204":
+          description: Album updated.
+        "400":
+          $ref: "#/components/responses/BadRequest"
+        "404":
+          $ref: "#/components/responses/ResourceNotFound"
+    delete:
+      tags: [Gallery]
+      operationId: deleteAlbum
+      summary: Delete an owned album without deleting its media
+      description: Deletes a manual album and its membership links. Media files and media records are not deleted. Automatic albums cannot be deleted.
+      responses:
+        "204":
+          description: Album deleted.
+        "404":
+          $ref: "#/components/responses/ResourceNotFound"
+  /albums/{albumId}/media:
+    post:
+      tags: [Gallery]
+      operationId: addAlbumMedia
+      summary: Add owned or shared media to an owned album
+      description: |
+        Adds all listed media in one transaction. The album must be manual and
+        owned by the current user. Every media item must be active and either
+        owned by or shared with that user. Existing membership is ignored, so
+        repeating an ID is idempotent. Any inaccessible ID rejects the complete
+        operation.
+      parameters:
+        - $ref: "#/components/parameters/AlbumID"
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/AlbumMediaInput"
+      responses:
+        "204":
+          description: Accessible media added.
+        "404":
+          $ref: "#/components/responses/ResourceNotFound"
+  /albums/{albumId}/media/{id}:
+    delete:
+      tags: [Gallery]
+      operationId: removeAlbumMedia
+      summary: Remove media from an owned album
+      description: Removes media from a manual album owned by the current user. Removing the current cover also clears `coverMediaId`.
+      parameters:
+        - $ref: "#/components/parameters/AlbumID"
+        - $ref: "#/components/parameters/UploadID"
+      responses:
+        "204":
+          description: Media removed from the album.
+        "404":
+          $ref: "#/components/responses/ResourceNotFound"
+  /albums/{albumId}/cover:
+    patch:
+      tags: [Gallery]
+      operationId: setAlbumCover
+      summary: Set an accessible album member as the cover
+      description: The selected media must already belong to the album, remain active, and be accessible to the album owner.
+      parameters:
+        - $ref: "#/components/parameters/AlbumID"
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              additionalProperties: false
+              required: [mediaId]
+              properties:
+                mediaId:
+                  type: string
+                  pattern: "^[0-9a-f]{32}$"
+                  description: Completed upload identifier of an existing album member.
+      responses:
+        "204":
+          description: Cover updated.
+        "404":
+          $ref: "#/components/responses/ResourceNotFound"
+  /media:
+    get:
+      tags: [Media]
+      operationId: listMedia
+      summary: List owned and shared media
+      description: |
+        In normal mode, returns active media owned by or shared with the current
+        user. In trash mode, returns only trashed media owned by the current user;
+        recipients never see an owner's trash. Favorite state is resolved for
+        the requesting user, not globally.
+      parameters:
+        - name: search
+          in: query
+          description: Case-insensitive substring search over filename and MIME type.
+          schema:
+            type: string
+        - name: kind
+          in: query
+          description: Filter by media kind. MIME types beginning with `video/` are videos; every other MIME type is treated as a photo.
+          schema:
+            type: string
+            enum: [photo, video]
+        - name: sort
+          in: query
+          description: Sort by completion time or filename-derived title.
+          schema:
+            type: string
+            enum: [newest, oldest, title]
+            default: newest
+        - name: trash
+          in: query
+          description: When true, lists only the current user's trashed media.
+          schema:
+            type: boolean
+            default: false
+        - name: capturedAfter
+          in: query
+          description: Include media captured at or after this timestamp.
+          schema: { type: string, format: date-time }
+        - name: capturedBefore
+          in: query
+          description: Include media captured at or before this timestamp.
+          schema: { type: string, format: date-time }
+        - name: latitude
+          in: query
+          description: Center latitude for a radius search. Used only with longitude and radiusKm.
+          schema: { type: number, format: double, minimum: -90, maximum: 90 }
+        - name: longitude
+          in: query
+          description: Center longitude for a radius search. Used only with latitude and radiusKm.
+          schema: { type: number, format: double, minimum: -180, maximum: 180 }
+        - name: radiusKm
+          in: query
+          description: Maximum great-circle distance in kilometers.
+          schema: { type: number, format: double, exclusiveMinimum: 0 }
+      responses:
+        "200":
+          description: Accessible completed media.
+          content:
+            application/json:
+              schema:
+                type: array
+                items:
+                  $ref: "#/components/schemas/Media"
+        "403":
+          $ref: "#/components/responses/Forbidden"
+  /media/files/{id}/favorite:
+    patch:
+      tags: [Gallery]
+      operationId: setFavorite
+      summary: Set the current user's favorite state for accessible media
+      description: Creates or updates a per-user preference. The media must be active and owned by or shared with the current user.
+      parameters:
+        - $ref: "#/components/parameters/UploadID"
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              additionalProperties: false
+              required: [favorite]
+              properties:
+                favorite:
+                  type: boolean
+      responses:
+        "204":
+          description: Personal favorite state updated.
+        "404":
+          $ref: "#/components/responses/ResourceNotFound"
+  /media/files/{id}:
+    delete:
+      tags: [Gallery]
+      operationId: trashMedia
+      summary: Move owned media to trash
+      description: Soft-deletes owned active media. It immediately disappears from recipients, downloads, normal listings, and album results.
+      parameters:
+        - $ref: "#/components/parameters/UploadID"
+      responses:
+        "204":
+          description: Media moved to trash and hidden from recipients.
+        "404":
+          $ref: "#/components/responses/ResourceNotFound"
+  /media/files/{id}/restore:
+    patch:
+      tags: [Gallery]
+      operationId: restoreMedia
+      summary: Restore owned media from trash
+      description: Clears the owner's soft-delete timestamp, restoring previous shares and album visibility where those links still exist.
+      parameters:
+        - $ref: "#/components/parameters/UploadID"
+      responses:
+        "204":
+          description: Media restored.
+        "404":
+          $ref: "#/components/responses/ResourceNotFound"
+  /media/files/{id}/permanent:
+    delete:
+      tags: [Gallery]
+      operationId: permanentlyDeleteMedia
+      summary: Permanently delete an owned media file and all associations
+      description: |
+        Stages the physical media file and generated thumbnail, then removes the
+        owned media record. A database failure restores the staged files.
+        Database cascades remove album membership and personal preferences for
+        that item. The owner's library-share relationships remain active for
+        their other current and future media. Missing files are tolerated.
+        Filesystem staging failures return `502` and prevent deletion.
+      parameters:
+        - $ref: "#/components/parameters/UploadID"
+      responses:
+        "204":
+          description: Media permanently deleted.
+        "404":
+          $ref: "#/components/responses/ResourceNotFound"
+        "502":
+          description: The physical media file could not be deleted.
+  /storage:
+    get:
+      tags: [Gallery]
+      operationId: getStorage
+      summary: Get totals for media accessible to the current user
+      description: Counts and sums active media owned by or shared with the current user. Shared bytes are included; trashed media is excluded.
+      responses:
+        "200":
+          description: User-scoped media totals.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Storage"
+        "403":
+          $ref: "#/components/responses/Forbidden"
+  /media/files/{id}/download:
+    get:
+      tags: [Media]
+      operationId: downloadMedia
+      summary: Download owned or shared media
+      description: Returns an active media file only when the current user owns it or has a share. Filesystem paths are constrained to the configured media root.
+      parameters:
+        - $ref: "#/components/parameters/UploadID"
+      responses:
+        "200":
+          description: Media bytes.
+          headers:
+            Content-Disposition:
+              description: Attachment disposition containing the stored filename.
+              schema:
+                type: string
+          content:
+            application/octet-stream:
+              schema:
+                type: string
+                format: binary
+        "404":
+          $ref: "#/components/responses/UploadNotFound"
+  /media/files/{id}/shares:
+    parameters:
+      - $ref: "#/components/parameters/UploadID"
+    post:
+      tags: [Media]
+      operationId: shareMedia
+      summary: Share owned media with a regular user
+      description: |
+        Creates a library-wide share from the current user to the target user.
+        The path media ID is used to verify that the current user owns active
+        media; the grant is not limited to that item. The recipient immediately
+        gains access to all of the owner's current active media, and future
+        uploads become accessible without another share request.
+
+        Shared media contributes to the recipient's lists, downloads, manual
+        albums, favorites, storage totals, and next nightly automatic-album
+        reconciliation. The target must be another regular user; administrators
+        and the owner cannot be recipients. Repeating the relationship is
+        idempotent.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/ShareRequest"
+      responses:
+        "204":
+          description: Library share added or already present.
+        "400":
+          $ref: "#/components/responses/BadRequest"
+    delete:
+      tags: [Media]
+      operationId: unshareMedia
+      summary: Remove a library share
+      description: |
+        Removes the owner-to-recipient relationship represented by the owned
+        media ID. All media belonging to that owner immediately becomes
+        inaccessible to the recipient. It disappears from lists, downloads,
+        storage totals, and album responses; future uploads are no longer shared.
+        Ownership and the owner's albums are unchanged. Legacy clients may still
+        send the username JSON body, but new clients should use the query
+        parameter.
+      parameters:
+        - name: username
+          in: query
+          required: true
+          description: Case-sensitive username of the regular-user recipient to remove.
+          schema:
+            type: string
+            minLength: 1
+      responses:
+        "204":
+          description: Library share removed.
+        "400":
+          $ref: "#/components/responses/BadRequest"
   /media/upload:
     post:
       tags: [Uploads]
       operationId: createUpload
       summary: Create an upload session
       description: |
-        Creates a resumable upload and returns its fixed chunk size and chunk
-        count. The JSON request body is limited to 64 KiB.
+        Creates a resumable upload owned by the authenticated regular user. The
+        account must have a non-empty upload folder. Administrators cannot upload.
+
+        The JSON request body is limited to 64 KiB and unknown fields are
+        rejected. Both `/` and `\` path components are removed from `filename`;
+        validation applies to the resulting basename. The optional client
+        checksum must be 64 hexadecimal characters. The declared size must not
+        exceed `ENV_MAX_UPLOAD_SIZE_BYTES` (100 GiB by default).
+
+        The response reports the fixed 8 MiB part size and total part count.
+        Upload metadata is persisted under the temporary directory, allowing an
+        active session and its uploaded parts to survive a server restart.
       requestBody:
         required: true
         content:
@@ -156,6 +937,7 @@ paths:
       tags: [Uploads]
       operationId: getUploadStatus
       summary: Get uploaded parts
+      description: Returns an active upload owned by the current user and scans its temporary directory for completed part files. `uploaded_parts` is `null` until the first part exists.
       responses:
         "200":
           description: Active upload status.
@@ -173,7 +955,7 @@ paths:
       tags: [Uploads]
       operationId: deleteUpload
       summary: Cancel and delete an upload
-      description: Deletes temporary metadata and all uploaded parts.
+      description: Deletes temporary metadata and all uploaded parts, then removes the active session. Completed media cannot be deleted through this endpoint.
       responses:
         "200":
           description: Upload deleted.
@@ -195,9 +977,16 @@ paths:
       operationId: uploadPart
       summary: Upload or replace one part
       description: |
-        Uploads raw bytes for a zero-indexed part. Every part must contain
-        exactly 8,388,608 bytes except the final part, whose expected size is
-        derived from the declared total size. Repeating a part replaces it.
+        Uploads raw bytes for a zero-indexed part owned by the current user.
+        Every non-final part must contain exactly 8,388,608 bytes. The final
+        part must contain exactly `size - part * 8,388,608` bytes. The server
+        reads at most one byte beyond the expected length to detect oversized
+        bodies.
+
+        Data is first written and synced to a temporary file and then atomically
+        renamed to the part path. A short, oversized, or interrupted write does
+        not replace a previously valid part. Repeating a valid part intentionally
+        replaces it.
       parameters:
         - $ref: "#/components/parameters/UploadID"
         - $ref: "#/components/parameters/PartNumber"
@@ -231,9 +1020,17 @@ paths:
       operationId: completeUpload
       summary: Assemble and persist an upload
       description: |
-        Concatenates all parts, verifies total size and optional client SHA-256,
-        stores the completed file, saves its metadata, and removes temporary
-        chunks. The returned SHA-256 is always computed by the server.
+        Verifies that every expected part exists, then concatenates parts in
+        numeric order while computing SHA-256. The assembled byte count must
+        match the declared size. When the upload supplied a client checksum, it
+        is compared case-insensitively with the computed digest.
+
+        The final relative path is
+        `{uploadFolder}/YYYY/MM/{uploadId}_{filename}`. Completion creates parent
+        directories, atomically moves the assembled file, persists the media
+        record, and removes temporary chunks and active-session metadata. The
+        returned lowercase SHA-256 is always computed by the server. Missing
+        parts return `409`; size or checksum mismatches return `400`.
       parameters:
         - $ref: "#/components/parameters/UploadID"
       responses:
@@ -252,22 +1049,485 @@ paths:
         "404":
           $ref: "#/components/responses/UploadNotFound"
         "409":
-          $ref: "#/components/responses/MissingPart"
+          $ref: "#/components/responses/UploadConflict"
         "500":
           $ref: "#/components/responses/InternalServerError"
+  /auth/recovery:
+    post:
+      tags: [Authentication]
+      operationId: verifyRecoveryCode
+      summary: Authenticate with a single-use TOTP recovery code
+      description: Requires the short-lived challenge returned after successful password verification. Three invalid attempts are rate limited with the same controls as TOTP verification.
+      security: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/RecoveryVerificationRequest"
+      responses:
+        "200":
+          description: Recovery code consumed and authenticated session created.
+          headers:
+            Set-Cookie:
+              schema: { type: string }
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/AuthenticatedResponse"
+        "400":
+          $ref: "#/components/responses/BadRequest"
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+        "429":
+          description: Too many authentication attempts.
+        "500":
+          $ref: "#/components/responses/InternalServerError"
+  /auth/recovery-codes:
+    post:
+      tags: [Authentication]
+      operationId: regenerateRecoveryCodes
+      summary: Replace and return TOTP recovery codes
+      description: Invalidates every previous code and returns ten new single-use codes. Only hashes are retained; this response is the only opportunity to save the plaintext values.
+      responses:
+        "201":
+          description: New recovery-code set.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/RecoveryCodesResponse"
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+        "500":
+          $ref: "#/components/responses/InternalServerError"
+  /admin/users/{id}/password:
+    patch:
+      tags: [Users]
+      operationId: resetUserPassword
+      summary: Reset a user's password and revoke their sessions
+      parameters:
+        - $ref: "#/components/parameters/UserID"
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/PasswordResetRequest"
+      responses:
+        "204":
+          description: Password replaced and all target-user sessions deleted.
+        "400":
+          $ref: "#/components/responses/BadRequest"
+        "403":
+          $ref: "#/components/responses/Forbidden"
+  /admin/users/{id}/quota:
+    patch:
+      tags: [Users]
+      operationId: setUserStorageQuota
+      summary: Set or clear a per-user storage quota
+      parameters:
+        - $ref: "#/components/parameters/UserID"
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/QuotaRequest"
+      responses:
+        "204":
+          description: Quota updated. A null value restores the environment default.
+        "400":
+          $ref: "#/components/responses/BadRequest"
+        "403":
+          $ref: "#/components/responses/Forbidden"
+  /admin/users/{id}/trash-retention:
+    patch:
+      tags: [Users]
+      operationId: setUserTrashRetention
+      summary: Set a user's trash retention period
+      parameters:
+        - $ref: "#/components/parameters/UserID"
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/TrashRetentionRequest"
+      responses:
+        "204":
+          description: Retention period updated.
+        "400":
+          $ref: "#/components/responses/BadRequest"
+        "403":
+          $ref: "#/components/responses/Forbidden"
+  /admin/storage/dashboard:
+    get:
+      tags: [Users]
+      operationId: getStorageDashboard
+      summary: Get aggregate and per-user storage usage
+      responses:
+        "200":
+          description: Storage dashboard.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/StorageDashboard"
+        "403":
+          $ref: "#/components/responses/Forbidden"
+  /admin/processing-jobs:
+    get:
+      tags: [Processing]
+      operationId: listProcessingJobs
+      summary: List the 200 most recently updated media-processing jobs
+      responses:
+        "200":
+          description: Processing jobs ordered by most recent update.
+          content:
+            application/json:
+              schema:
+                type: array
+                items:
+                  $ref: "#/components/schemas/ProcessingJob"
+        "403":
+          $ref: "#/components/responses/Forbidden"
+        "500":
+          $ref: "#/components/responses/InternalServerError"
+  /admin/processing-jobs/{id}/retry:
+    post:
+      tags: [Processing]
+      operationId: retryProcessingJob
+      summary: Retry a failed processing job
+      parameters:
+        - $ref: "#/components/parameters/JobID"
+      responses:
+        "204":
+          description: Job reset to queued with its attempt count cleared.
+        "403":
+          $ref: "#/components/responses/Forbidden"
+        "404":
+          $ref: "#/components/responses/ResourceNotFound"
+  /admin/trash/cleanup:
+    post:
+      tags: [Operations]
+      operationId: cleanupExpiredTrash
+      summary: Permanently remove expired trash immediately
+      responses:
+        "200":
+          description: Cleanup result for up to 500 records.
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [removed]
+                properties:
+                  removed: { type: integer, minimum: 0 }
+        "403":
+          $ref: "#/components/responses/Forbidden"
+        "500":
+          $ref: "#/components/responses/InternalServerError"
+  /media/app:
+    get:
+      tags: [Media]
+      operationId: mediaWorkspacePage
+      summary: Open the embedded media workspace
+      responses:
+        "200":
+          description: Authenticated media workspace HTML.
+          content:
+            text/html:
+              schema: { type: string }
+        "403":
+          $ref: "#/components/responses/Forbidden"
+        "404":
+          description: Frontend pages are disabled.
+  /media/upload/check:
+    post:
+      tags: [Uploads]
+      operationId: checkDuplicateMedia
+      summary: Check an owner-scoped SHA-256 digest
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/DuplicateCheckRequest"
+      responses:
+        "200":
+          description: Duplicate lookup result.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/DuplicateCheckResponse"
+        "400":
+          $ref: "#/components/responses/BadRequest"
+        "403":
+          $ref: "#/components/responses/Forbidden"
+        "500":
+          $ref: "#/components/responses/InternalServerError"
+  /media/files/{id}/thumbnail:
+    get:
+      tags: [Media]
+      operationId: downloadThumbnail
+      summary: Get a generated thumbnail for accessible media
+      parameters:
+        - $ref: "#/components/parameters/UploadID"
+      responses:
+        "200":
+          description: Generated JPEG thumbnail.
+          headers:
+            Cache-Control:
+              schema: { type: string }
+          content:
+            image/jpeg:
+              schema: { type: string, format: binary }
+        "404":
+          $ref: "#/components/responses/ResourceNotFound"
+  /media/files/{id}/processing-status:
+    get:
+      tags: [Processing]
+      operationId: getMediaProcessingStatus
+      summary: Get processing status for accessible media
+      parameters:
+        - $ref: "#/components/parameters/UploadID"
+      responses:
+        "200":
+          description: Processing job status.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ProcessingJob"
+        "404":
+          $ref: "#/components/responses/ResourceNotFound"
+  /media/public-links:
+    post:
+      tags: [Public Sharing]
+      operationId: createPublicLink
+      summary: Create an expiring public media or album link
+      description: Album links are accepted only when every album item is owned by the link creator. Media received through a library share is never exposed publicly by its recipient.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/CreatePublicLinkRequest"
+      responses:
+        "201":
+          description: Public link created. The plaintext token is returned only here.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/CreatePublicLinkResponse"
+        "400":
+          $ref: "#/components/responses/BadRequest"
+        "403":
+          $ref: "#/components/responses/Forbidden"
+  /media/public-links/{id}:
+    delete:
+      tags: [Public Sharing]
+      operationId: revokePublicLink
+      summary: Revoke an owned public link
+      parameters:
+        - $ref: "#/components/parameters/PublicLinkID"
+      responses:
+        "204":
+          description: Public link revoked.
+        "404":
+          $ref: "#/components/responses/ResourceNotFound"
+  /public/{token}:
+    get:
+      tags: [Public Sharing]
+      operationId: resolvePublicLink
+      summary: Get public-link metadata
+      security: []
+      parameters:
+        - $ref: "#/components/parameters/PublicToken"
+        - $ref: "#/components/parameters/SharePassword"
+      responses:
+        "200":
+          description: Public share metadata.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/PublicLinkContent"
+        "401":
+          description: Share password required or invalid.
+        "404":
+          $ref: "#/components/responses/ResourceNotFound"
+        "429":
+          description: Three failed password attempts locked this token/client pair for five minutes.
+  /public/{token}/download:
+    get:
+      tags: [Public Sharing]
+      operationId: downloadPublicLink
+      summary: Download public media or an album ZIP
+      security: []
+      parameters:
+        - $ref: "#/components/parameters/PublicToken"
+        - $ref: "#/components/parameters/SharePassword"
+      responses:
+        "200":
+          description: Original media bytes or a streamed ZIP archive for an album.
+          content:
+            application/octet-stream:
+              schema: { type: string, format: binary }
+            application/zip:
+              schema: { type: string, format: binary }
+        "401":
+          description: Share password required or invalid.
+        "404":
+          $ref: "#/components/responses/ResourceNotFound"
+        "429":
+          description: Password attempts are temporarily locked.
+  /media/upload-batches:
+    post:
+      tags: [Uploads]
+      operationId: createUploadBatch
+      summary: Create a durable resumable-upload batch
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/CreateUploadBatchRequest"
+      responses:
+        "201":
+          description: Upload batch created.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/UploadBatch"
+        "400":
+          $ref: "#/components/responses/BadRequest"
+  /media/upload-batches/{id}:
+    get:
+      tags: [Uploads]
+      operationId: getUploadBatch
+      summary: Get durable batch progress
+      parameters:
+        - $ref: "#/components/parameters/BatchID"
+      responses:
+        "200":
+          description: Current completed file and byte totals.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/UploadBatch"
+        "404":
+          $ref: "#/components/responses/ResourceNotFound"
+  /media/upload-batches/{id}/cancel:
+    post:
+      tags: [Uploads]
+      operationId: cancelUploadBatch
+      summary: Cancel an active batch
+      description: Prevents new sessions and late upload completions from joining the batch. Already completed media remain available.
+      parameters:
+        - $ref: "#/components/parameters/BatchID"
+      responses:
+        "204":
+          description: Batch canceled.
+        "404":
+          $ref: "#/components/responses/ResourceNotFound"
+  /media/export:
+    get:
+      tags: [Transfer]
+      operationId: exportMediaMetadata
+      summary: Export owned media and manual album metadata
+      responses:
+        "200":
+          description: Versioned JSON metadata manifest.
+          headers:
+            Content-Disposition:
+              schema: { type: string }
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/MetadataManifest"
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+        "500":
+          $ref: "#/components/responses/InternalServerError"
+  /media/import:
+    post:
+      tags: [Transfer]
+      operationId: importMediaMetadata
+      summary: Import manual albums from a versioned metadata manifest
+      description: Album membership is restored only for active media owned by the importing user. The request body is limited to 10 MiB.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/MetadataManifest"
+      responses:
+        "202":
+          description: Import completed and recorded as an import session.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ImportResult"
+        "400":
+          $ref: "#/components/responses/BadRequest"
 components:
   securitySchemes:
     sessionCookie:
       type: apiKey
       in: cookie
       name: pal_medias_uploader_session
-      description: Opaque session token issued after successful TOTP verification.
+      description: |
+        Opaque session token stored only as a hash by the server. It is issued
+        after successful TOTP verification, or immediately for the initial
+        administrator, and expires after 30 days. Browser cookies are HttpOnly,
+        use path `/`, and are Secure whenever the request is HTTPS.
   parameters:
+    UserID:
+      name: id
+      in: path
+      required: true
+      schema: { type: string, format: uuid }
+      description: Target account UUID.
+    JobID:
+      name: id
+      in: path
+      required: true
+      schema: { type: string, pattern: "^[0-9a-f]{32}$" }
+      description: Processing job identifier, equal to its upload ID.
+    BatchID:
+      name: id
+      in: path
+      required: true
+      schema: { type: string, format: uuid }
+      description: Owner-scoped upload batch UUID.
+    PublicLinkID:
+      name: id
+      in: path
+      required: true
+      schema: { type: string, pattern: "^[0-9a-f]{64}$" }
+      description: Stored SHA-256 identifier returned when the public link was created.
+    PublicToken:
+      name: token
+      in: path
+      required: true
+      schema: { type: string, minLength: 40, maxLength: 64 }
+      description: Opaque plaintext public token returned only at link creation.
+    SharePassword:
+      name: X-Share-Password
+      in: header
+      required: false
+      schema: { type: string, format: password }
+      description: Required when the owner protected the public link with a password.
+    AlbumID:
+      name: albumId
+      in: path
+      required: true
+      schema:
+        type: string
+        format: uuid
+      description: User-owned album UUID. Inaccessible album IDs are reported as not found.
     UploadID:
       name: id
       in: path
       required: true
-      description: 32-character lowercase hexadecimal upload identifier.
+      description: 32-character lowercase hexadecimal identifier shared by an upload session and its completed media record.
       schema:
         type: string
         pattern: "^[0-9a-f]{32}$"
@@ -289,26 +1549,39 @@ components:
         username:
           type: string
           minLength: 1
+          description: Case-sensitive username. Surrounding whitespace is ignored.
           examples: [admin]
         password:
           type: string
           format: password
           minLength: 1
+          description: Plaintext password transported over HTTPS and checked with bcrypt.
     LoginChallenge:
       type: object
       additionalProperties: false
-      required: [challengeToken]
+      description: Exactly one shape is returned, immediate authentication or a TOTP challenge.
+      oneOf:
+        - required: [authenticated]
+          properties:
+            authenticated:
+              const: true
+        - required: [challengeToken]
       properties:
         challengeToken:
           type: string
+          minLength: 1
           description: Opaque challenge valid for five minutes.
         provisioningUri:
           type: string
           format: uri
-          description: Present only when the account requires initial TOTP enrollment.
+          description: Present only while a managed account requires initial TOTP enrollment.
         secret:
           type: string
-          description: Base32 TOTP secret present only during initial enrollment.
+          pattern: "^[A-Z2-7]+=*$"
+          description: Base32 TOTP secret present only during initial enrollment. Store it securely.
+        authenticated:
+          type: boolean
+          description: True only when password login immediately created a session for the initial administrator.
     VerifyTOTPRequest:
       type: object
       additionalProperties: false
@@ -331,24 +1604,271 @@ components:
     SessionResponse:
       type: object
       additionalProperties: false
+      required: [id, username, role, uploadFolder, totpEnabled]
+      properties:
+        id:
+          type: string
+          format: uuid
+        username:
+          type: string
+        role:
+          type: string
+          enum: [admin, user]
+        uploadFolder:
+          type: string
+          description: Relative upload destination for regular users; empty for administrators.
+        totpEnabled:
+          type: boolean
+          description: True when the account has an active TOTP secret.
+    User:
+      type: object
+      additionalProperties: false
+      required: [id, username, role, totpEnabled, storageQuotaBytes, storageUsedBytes, trashRetentionDays]
+      properties:
+        id:
+          type: string
+          format: uuid
+        username:
+          type: string
+          description: Unique, case-sensitive login name.
+        role:
+          type: string
+          enum: [admin, user]
+        uploadFolder:
+          type: string
+          description: Relative media destination. Empty for administrators.
+        totpEnabled:
+          type: boolean
+          description: Whether an active TOTP secret is stored for this account.
+        storageQuotaBytes:
+          type: [integer, "null"]
+          format: int64
+          minimum: 1
+          description: Per-user override or null when the environment default applies.
+        storageUsedBytes:
+          type: integer
+          format: int64
+          minimum: 0
+        trashRetentionDays:
+          type: integer
+          minimum: 1
+          maximum: 3650
+    CreateUserRequest:
+      type: object
+      additionalProperties: false
+      required: [username, password, role]
+      properties:
+        username:
+          type: string
+          minLength: 1
+          description: Unique, case-sensitive username; surrounding whitespace is removed.
+        password:
+          type: string
+          format: password
+          minLength: 12
+        role:
+          type: string
+          enum: [admin, user]
+          description: Trimmed and normalized to lowercase by the server.
+        uploadFolder:
+          type: string
+          description: Required for regular users and ignored for administrators. Must be relative and cannot contain parent traversal.
+    CreateUserResponse:
+      type: object
+      additionalProperties: false
+      required: [user, provisioningUri, qrCode]
+      properties:
+        user:
+          $ref: "#/components/schemas/User"
+        provisioningUri:
+          type: string
+          format: uri
+          description: Authenticator provisioning URI returned only when the account is created.
+        qrCode:
+          type: string
+          pattern: "^data:image/png;base64,"
+          description: PNG data URI for one-time TOTP setup, returned only when the account is created.
+    ShareRequest:
+      type: object
+      additionalProperties: false
       required: [username]
       properties:
         username:
           type: string
+          minLength: 1
+          description: Case-sensitive username of a regular-user recipient.
+    AlbumInput:
+      type: object
+      additionalProperties: false
+      required: [title]
+      properties:
+        title:
+          type: string
+          minLength: 1
+          description: Album title after trimming; blank values are rejected.
+        description:
+          type: string
+          description: Optional description; surrounding whitespace is removed.
+    AlbumMediaInput:
+      type: object
+      additionalProperties: false
+      required: [mediaIds]
+      properties:
+        mediaIds:
+          type: array
+          description: Completed upload IDs. Every item must be active and accessible. An empty list is a successful no-op.
+          items:
+            type: string
+            pattern: "^[0-9a-f]{32}$"
+    Album:
+      type: object
+      additionalProperties: false
+      required: [id, ownerId, title, description, automatic, createdAt, itemCount]
+      properties:
+        id:
+          type: string
+          format: uuid
+        ownerId:
+          type: string
+          format: uuid
+        title:
+          type: string
+        description:
+          type: string
+        automatic:
+          type: boolean
+          description: True for a nightly managed weekly album or a daily album created when a date has more than 15 active items.
+        createdAt:
+          type: string
+          format: date-time
+        itemCount:
+          type: integer
+          format: int64
+          minimum: 0
+          description: Count of active album members still accessible to the owner.
+        coverMediaId:
+          type: string
+          pattern: "^[0-9a-f]{32}$"
+          description: Optional completed-upload ID selected from current album membership.
+        media:
+          type: array
+          description: Present on album-detail responses and omitted from album-list responses when empty.
+          items:
+            $ref: "#/components/schemas/Media"
+    Media:
+      type: object
+      additionalProperties: false
+      required: [id, ownerId, ownerUsername, title, kind, favorite, fileName, mimeType, fileSize, sha256, createdAt, shared]
+      properties:
+        id:
+          type: string
+          pattern: "^[0-9a-f]{32}$"
+          description: Original completed upload identifier.
+        ownerId:
+          type: string
+          format: uuid
+        ownerUsername:
+          type: string
+        title:
+          type: string
+          description: Display title derived from the filename by removing its final extension.
+        kind:
+          type: string
+          enum: [photo, video]
+          description: "`video` when MIME type starts with `video/`; otherwise `photo`."
+        favorite:
+          type: boolean
+          description: Personal state for the current user.
+        fileName:
+          type: string
+          description: Sanitized basename supplied when the upload was created.
+        mimeType:
+          type: string
+        fileSize:
+          type: integer
+          format: int64
+          minimum: 1
+        sha256:
+          type: string
+          pattern: "^[0-9a-f]{64}$"
+          description: Lowercase digest computed by the server during completion.
+        createdAt:
+          type: string
+          format: date-time
+          description: Upload completion timestamp used for gallery ordering and automatic album dates.
+        shared:
+          type: boolean
+          description: True when the current user is a recipient rather than the owner.
+        deletedAt:
+          type: string
+          format: date-time
+          description: Present only for owner trash listings.
+        thumbnailUrl:
+          type: string
+          description: Protected thumbnail endpoint, present after processing succeeds.
+        width:
+          type: integer
+          minimum: 1
+        height:
+          type: integer
+          minimum: 1
+        durationSeconds:
+          type: number
+          format: double
+          minimum: 0
+        capturedAt:
+          type: string
+          format: date-time
+        latitude:
+          type: number
+          format: double
+          minimum: -90
+          maximum: 90
+        longitude:
+          type: number
+          format: double
+          minimum: -180
+          maximum: 180
+    Storage:
+      type: object
+      additionalProperties: false
+      required: [totalBytes, photoBytes, videoBytes, photoCount, videoCount]
+      properties:
+        totalBytes:
+          type: integer
+          format: int64
+          minimum: 0
+        photoBytes:
+          type: integer
+          format: int64
+          minimum: 0
+        videoBytes:
+          type: integer
+          format: int64
+          minimum: 0
+        photoCount:
+          type: integer
+          format: int64
+          minimum: 0
+        videoCount:
+          type: integer
+          format: int64
+          minimum: 0
     CreateUploadRequest:
       type: object
+      additionalProperties: false
       required: [filename, size]
       properties:
         filename:
           type: string
           minLength: 1
           maxLength: 255
-          description: Paths are reduced to their base filename by the server.
+          description: Directory components using `/` or `\` are removed; the resulting basename must be 1-255 characters and cannot be `.` or `..`.
           examples: [video.mp4]
         mime_type:
           type: string
           maxLength: 255
-          description: Informational media type.
+          description: Informational media type used to derive photo/video kind. Content sniffing is not performed.
           examples: [video/mp4]
         size:
           type: integer
@@ -358,7 +1878,11 @@ components:
         sha256:
           type: string
           pattern: "^[0-9A-Fa-f]{64}$"
-          description: Optional SHA-256 used to verify the assembled file.
+          description: Optional case-insensitive client SHA-256 used to verify the assembled file.
+        batchId:
+          type: string
+          format: uuid
+          description: Optional active upload batch owned by the current user.
     CreateUploadResponse:
       type: object
       additionalProperties: false
@@ -410,7 +1934,7 @@ components:
           format: int64
           minimum: 1
         uploaded_parts:
-          description: Uploaded zero-indexed parts; null when no parts exist yet.
+          description: Uploaded zero-indexed parts discovered on disk; null when no parts exist yet.
           type: [array, "null"]
           items:
             type: integer
@@ -426,7 +1950,7 @@ components:
           const: completed
         media_path:
           type: string
-          description: Relative path formatted as YYYY/MM/{upload-id}_{filename}.
+          description: Relative path formatted as {user-folder}/YYYY/MM/{upload-id}_{filename}.
         size:
           type: integer
           format: int64
@@ -442,6 +1966,275 @@ components:
         status:
           type: string
           const: deleted
+    RecoveryVerificationRequest:
+      type: object
+      additionalProperties: false
+      required: [challengeToken, code]
+      properties:
+        challengeToken:
+          type: string
+          minLength: 1
+        code:
+          type: string
+          pattern: "^[A-Za-z2-7 -]+$"
+          description: One of the generated Base32 recovery codes. Hyphens, spaces, and letter case are ignored.
+    RecoveryCodesResponse:
+      type: object
+      additionalProperties: false
+      required: [recoveryCodes]
+      properties:
+        recoveryCodes:
+          type: array
+          minItems: 10
+          maxItems: 10
+          items:
+            type: string
+            pattern: "^[A-Z2-7]{4}-[A-Z2-7]{4}-[A-Z2-7]{4}-[A-Z2-7]{4}$"
+    PasswordResetRequest:
+      type: object
+      additionalProperties: false
+      required: [password]
+      properties:
+        password:
+          type: string
+          format: password
+          minLength: 12
+    QuotaRequest:
+      type: object
+      additionalProperties: false
+      required: [storageQuotaBytes]
+      properties:
+        storageQuotaBytes:
+          type: [integer, "null"]
+          format: int64
+          minimum: 1
+          description: Positive per-user limit or null to use the environment default.
+    TrashRetentionRequest:
+      type: object
+      additionalProperties: false
+      required: [days]
+      properties:
+        days:
+          type: integer
+          minimum: 1
+          maximum: 3650
+    StorageDashboard:
+      type: object
+      additionalProperties: false
+      required: [totalUsedBytes, users]
+      properties:
+        totalUsedBytes:
+          type: integer
+          format: int64
+          minimum: 0
+        users:
+          type: array
+          items:
+            $ref: "#/components/schemas/User"
+    ProcessingJob:
+      type: object
+      additionalProperties: false
+      required: [id, uploadId, status, attempts, scheduledFor, updatedAt]
+      properties:
+        id:
+          type: string
+          pattern: "^[0-9a-f]{32}$"
+        uploadId:
+          type: string
+          pattern: "^[0-9a-f]{32}$"
+        ownerId:
+          type: string
+          format: uuid
+          description: Present only on internally claimed jobs; normally omitted from API responses.
+        status:
+          type: string
+          enum: [queued, processing, completed, failed]
+        attempts:
+          type: integer
+          minimum: 0
+        lastError:
+          type: string
+        scheduledFor:
+          type: string
+          format: date-time
+        updatedAt:
+          type: string
+          format: date-time
+    DuplicateCheckRequest:
+      type: object
+      additionalProperties: false
+      required: [sha256]
+      properties:
+        sha256:
+          type: string
+          pattern: "^[0-9A-Fa-f]{64}$"
+    DuplicateMediaSummary:
+      type: object
+      additionalProperties: false
+      required: [id, filename, size, createdAt]
+      properties:
+        id:
+          type: string
+          pattern: "^[0-9a-f]{32}$"
+        filename:
+          type: string
+        size:
+          type: integer
+          format: int64
+          minimum: 1
+        createdAt:
+          type: string
+          format: date-time
+    DuplicateCheckResponse:
+      type: object
+      additionalProperties: false
+      required: [duplicate]
+      properties:
+        duplicate:
+          type: boolean
+        media:
+          $ref: "#/components/schemas/DuplicateMediaSummary"
+          description: Present only when duplicate is true.
+    CreatePublicLinkRequest:
+      type: object
+      additionalProperties: false
+      required: [expiresAt]
+      oneOf:
+        - required: [mediaId]
+        - required: [albumId]
+      properties:
+        mediaId:
+          type: string
+          pattern: "^[0-9a-f]{32}$"
+        albumId:
+          type: string
+          format: uuid
+        password:
+          type: string
+          format: password
+          minLength: 8
+          description: Omit or send an empty string for an unprotected link.
+        expiresAt:
+          type: string
+          format: date-time
+          description: Must be in the future.
+    CreatePublicLinkResponse:
+      type: object
+      additionalProperties: false
+      required: [id, token, url, expiresAt]
+      properties:
+        id:
+          type: string
+          pattern: "^[0-9a-f]{64}$"
+          description: Stored identifier used for owner revocation.
+        token:
+          type: string
+          description: Plaintext opaque token returned only in this response.
+        url:
+          type: string
+          pattern: "^/public/"
+        expiresAt:
+          type: string
+          format: date-time
+    PublicFile:
+      type: object
+      additionalProperties: false
+      required: [filename, mimeType, size]
+      properties:
+        filename: { type: string }
+        mimeType: { type: string }
+        size: { type: integer, format: int64, minimum: 1 }
+    PublicLinkContent:
+      type: object
+      additionalProperties: false
+      required: [title, expiresAt, files]
+      properties:
+        title: { type: string }
+        expiresAt: { type: string, format: date-time }
+        files:
+          type: array
+          items:
+            $ref: "#/components/schemas/PublicFile"
+    CreateUploadBatchRequest:
+      type: object
+      additionalProperties: false
+      required: [name, expectedFiles, expectedBytes]
+      properties:
+        name: { type: string }
+        expectedFiles:
+          type: integer
+          minimum: 1
+          maximum: 10000
+        expectedBytes:
+          type: integer
+          format: int64
+          minimum: 1
+    UploadBatch:
+      type: object
+      additionalProperties: false
+      required: [id, name, expectedFiles, expectedBytes, completedFiles, completedBytes, status, createdAt]
+      properties:
+        id: { type: string, format: uuid }
+        name: { type: string }
+        expectedFiles: { type: integer, minimum: 1 }
+        expectedBytes: { type: integer, format: int64, minimum: 1 }
+        completedFiles: { type: integer, minimum: 0 }
+        completedBytes: { type: integer, format: int64, minimum: 0 }
+        status:
+          type: string
+          enum: [active, completed, canceled]
+        createdAt: { type: string, format: date-time }
+    ManifestMedia:
+      type: object
+      additionalProperties: false
+      required: [id, filename, mimeType, size, sha256, createdAt]
+      properties:
+        id: { type: string, pattern: "^[0-9a-f]{32}$" }
+        filename: { type: string }
+        mimeType: { type: string }
+        size: { type: integer, format: int64, minimum: 1 }
+        sha256: { type: string, pattern: "^[0-9a-f]{64}$" }
+        createdAt: { type: string, format: date-time }
+    ManifestAlbum:
+      type: object
+      additionalProperties: false
+      required: [title, description, mediaIds]
+      properties:
+        title: { type: string, minLength: 1 }
+        description: { type: string }
+        mediaIds:
+          type: array
+          items: { type: string, pattern: "^[0-9a-f]{32}$" }
+    MetadataManifest:
+      type: object
+      additionalProperties: false
+      required: [version, albums]
+      properties:
+        version:
+          type: integer
+          const: 1
+        exportedAt:
+          type: string
+          format: date-time
+          description: Set on exports and ignored during import.
+        media:
+          type: array
+          description: Read-only media inventory; binary files are not imported.
+          items:
+            $ref: "#/components/schemas/ManifestMedia"
+        albums:
+          type: array
+          maxItems: 1000
+          items:
+            $ref: "#/components/schemas/ManifestAlbum"
+    ImportResult:
+      type: object
+      additionalProperties: false
+      required: [sessionId, status, importedAlbums]
+      properties:
+        sessionId: { type: string, format: uuid }
+        status: { type: string, const: completed }
+        importedAlbums: { type: integer, minimum: 0 }
     ErrorResponse:
       type: object
       additionalProperties: false
@@ -449,6 +2242,7 @@ components:
       properties:
         error:
           type: string
+          description: Stable or human-readable error message. Clients should primarily branch on HTTP status.
   responses:
     BadRequest:
       description: Malformed JSON or unknown authentication request field.
@@ -484,7 +2278,13 @@ components:
               value:
                 error: Unauthorized
     ForbiddenOrigin:
-      description: The Origin header is not in the configured CORS allowlist. Response has no body.
+      description: The Origin header is not in the comma-separated `ENV_CORS_ALLOWED_ORIGINS` allowlist. Response has no body.
+    Forbidden:
+      description: The authenticated account does not have the required role.
+      content:
+        application/json:
+          schema:
+            $ref: "#/components/schemas/ErrorResponse"
     UploadNotFound:
       description: Upload does not exist or is no longer active.
       content:
@@ -495,13 +2295,22 @@ components:
             notFound:
               value:
                 error: upload not found
-    MissingPart:
-      description: At least one expected upload part is missing.
+    ResourceNotFound:
+      description: The resource does not exist, is not owned by the current user, or is otherwise inaccessible. This avoids disclosing another user's resources.
+      content:
+        application/json:
+          schema:
+            $ref: "#/components/schemas/ErrorResponse"
+    UploadConflict:
+      description: The checksum already belongs to owned media, or at least one expected upload part is missing.
       content:
         application/json:
           schema:
             $ref: "#/components/schemas/ErrorResponse"
           examples:
+            duplicate:
+              value:
+                error: media with this checksum already exists
             missingPart:
               value:
                 error: missing part 2

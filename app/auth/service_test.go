@@ -7,24 +7,18 @@ import (
 	"time"
 
 	"github.com/pquerna/otp/totp"
+	"golang.org/x/crypto/bcrypt"
 )
 
 type memoryRepository struct {
-	user      User
-	challenge Challenge
-	session   string
+	user               User
+	challenge          Challenge
+	challengeAvailable bool
+	session            string
+	recoveryCodes      map[string]bool
+	enableTOTPSucceeds *bool
 }
 
-func (repository *memoryRepository) AuthUserCount(context.Context) (int, error) {
-	if repository.user.ID == "" {
-		return 0, nil
-	}
-	return 1, nil
-}
-func (repository *memoryRepository) CreateAuthUser(_ context.Context, user User) error {
-	repository.user = user
-	return nil
-}
 func (repository *memoryRepository) GetAuthUserByUsername(_ context.Context, username string) (User, error) {
 	if repository.user.Username != username {
 		return User{}, errors.New("not found")
@@ -33,38 +27,86 @@ func (repository *memoryRepository) GetAuthUserByUsername(_ context.Context, use
 }
 func (repository *memoryRepository) CreateAuthChallenge(_ context.Context, _ string, userID, secret string, expiresAt time.Time) error {
 	repository.challenge = Challenge{UserID: userID, Username: repository.user.Username, TOTPSecret: repository.user.TOTPSecret, PendingSecret: secret, ExpiresAt: expiresAt}
+	repository.challengeAvailable = true
 	return nil
 }
 func (repository *memoryRepository) GetAuthChallenge(context.Context, string) (Challenge, error) {
+	if !repository.challengeAvailable {
+		return Challenge{}, errors.New("not found")
+	}
 	return repository.challenge, nil
 }
-func (repository *memoryRepository) DeleteAuthChallenge(context.Context, string) error { return nil }
-func (repository *memoryRepository) EnableTOTP(_ context.Context, _ string, secret string) error {
+func (repository *memoryRepository) DeleteAuthChallenge(context.Context, string) (bool, error) {
+	if !repository.challengeAvailable {
+		return false, nil
+	}
+	repository.challengeAvailable = false
+	return true, nil
+}
+func (repository *memoryRepository) EnableTOTP(_ context.Context, _ string, secret string) (bool, error) {
+	if repository.enableTOTPSucceeds != nil && !*repository.enableTOTPSucceeds {
+		return false, nil
+	}
 	repository.user.TOTPSecret = secret
-	return nil
+	return true, nil
 }
 func (repository *memoryRepository) CreateAuthSession(_ context.Context, tokenHash, _ string, _ time.Time) error {
 	repository.session = tokenHash
 	return nil
 }
-func (repository *memoryRepository) GetAuthSessionUsername(_ context.Context, tokenHash string, _ time.Time) (string, error) {
+func (repository *memoryRepository) GetAuthSessionUser(_ context.Context, tokenHash string, _ time.Time) (User, error) {
 	if tokenHash != repository.session {
-		return "", errors.New("not found")
+		return User{}, errors.New("not found")
 	}
-	return repository.user.Username, nil
+	return repository.user, nil
 }
 func (repository *memoryRepository) DeleteAuthSession(context.Context, string) error {
 	repository.session = ""
 	return nil
 }
+func (repository *memoryRepository) ReplaceRecoveryCodes(_ context.Context, _ string, hashes []string) error {
+	repository.recoveryCodes = make(map[string]bool, len(hashes))
+	for _, hash := range hashes {
+		repository.recoveryCodes[hash] = true
+	}
+	return nil
+}
+func (repository *memoryRepository) ConsumeRecoveryCode(_ context.Context, _ string, hash string) (bool, error) {
+	if !repository.recoveryCodes[hash] {
+		return false, nil
+	}
+	delete(repository.recoveryCodes, hash)
+	return true, nil
+}
+
+func TestRecoveryCodeIsSingleUse(t *testing.T) {
+	ctx := context.Background()
+	repository := &memoryRepository{user: passwordUser(t, true)}
+	service := NewService(repository, "PAL Gallery Test")
+	codes, err := service.GenerateRecoveryCodes(ctx, repository.user.ID)
+	if err != nil || len(codes) != 10 {
+		t.Fatalf("generate recovery codes: count=%d err=%v", len(codes), err)
+	}
+	challenge, err := service.BeginLogin(ctx, "admin", "correct-horse-battery")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := service.VerifyRecoveryCode(ctx, challenge.ChallengeToken, codes[0]); err != nil {
+		t.Fatal(err)
+	}
+	challenge, err = service.BeginLogin(ctx, "admin", "correct-horse-battery")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := service.VerifyRecoveryCode(ctx, challenge.ChallengeToken, codes[0]); !errors.Is(err, ErrInvalidCode) {
+		t.Fatalf("reused recovery code returned %v", err)
+	}
+}
 
 func TestEnrollmentCreatesAuthenticatedSession(t *testing.T) {
 	ctx := context.Background()
-	repository := &memoryRepository{}
+	repository := &memoryRepository{user: passwordUser(t, true)}
 	service := NewService(repository, "PAL Gallery Test")
-	if err := service.EnsureAdmin(ctx, "admin", "correct-horse-battery"); err != nil {
-		t.Fatal(err)
-	}
 	challenge, err := service.BeginLogin(ctx, "admin", "correct-horse-battery")
 	if err != nil {
 		t.Fatal(err)
@@ -80,23 +122,84 @@ func TestEnrollmentCreatesAuthenticatedSession(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	username, err := service.Authenticate(ctx, session)
+	user, err := service.Authenticate(ctx, session)
 	if err != nil {
 		t.Fatal(err)
 	}
-	if username != "admin" {
-		t.Fatalf("got username %q", username)
+	if user.Username != "admin" {
+		t.Fatalf("got username %q", user.Username)
+	}
+}
+
+func TestChallengeCannotBeReused(t *testing.T) {
+	ctx := context.Background()
+	repository := &memoryRepository{user: passwordUser(t, true)}
+	service := NewService(repository, "PAL Gallery Test")
+	challenge, err := service.BeginLogin(ctx, "admin", "correct-horse-battery")
+	if err != nil {
+		t.Fatal(err)
+	}
+	code, err := totp.GenerateCode(challenge.Secret, time.Now())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := service.Verify(ctx, challenge.ChallengeToken, code); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := service.Verify(ctx, challenge.ChallengeToken, code); !errors.Is(err, ErrInvalidChallenge) {
+		t.Fatalf("got %v, want invalid challenge", err)
+	}
+}
+
+func TestEnrollmentRejectsLostRace(t *testing.T) {
+	ctx := context.Background()
+	enableTOTPSucceeds := false
+	repository := &memoryRepository{user: passwordUser(t, true), enableTOTPSucceeds: &enableTOTPSucceeds}
+	service := NewService(repository, "PAL Gallery Test")
+	challenge, err := service.BeginLogin(ctx, "admin", "correct-horse-battery")
+	if err != nil {
+		t.Fatal(err)
+	}
+	code, err := totp.GenerateCode(challenge.Secret, time.Now())
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	if _, err := service.Verify(ctx, challenge.ChallengeToken, code); !errors.Is(err, ErrInvalidChallenge) {
+		t.Fatalf("lost enrollment race returned %v", err)
+	}
+	if !repository.challengeAvailable || repository.session != "" {
+		t.Fatalf("losing verifier consumed the challenge or created a session")
+	}
+}
+
+func TestAdminLoginDoesNotRequireTOTP(t *testing.T) {
+	ctx := context.Background()
+	repository := &memoryRepository{user: passwordUser(t, false)}
+	service := NewService(repository, "PAL Gallery Test")
+	result, err := service.BeginLogin(ctx, "admin", "correct-horse-battery")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !result.Authenticated || result.SessionToken == "" || result.ChallengeToken != "" {
+		t.Fatalf("unexpected login result: %#v", result)
 	}
 }
 
 func TestLoginRejectsWrongPassword(t *testing.T) {
 	ctx := context.Background()
-	repository := &memoryRepository{}
+	repository := &memoryRepository{user: passwordUser(t, false)}
 	service := NewService(repository, "PAL Gallery Test")
-	if err := service.EnsureAdmin(ctx, "admin", "correct-horse-battery"); err != nil {
-		t.Fatal(err)
-	}
 	if _, err := service.BeginLogin(ctx, "admin", "wrong"); !errors.Is(err, ErrInvalidCredentials) {
 		t.Fatalf("got %v", err)
 	}
+}
+
+func passwordUser(t *testing.T, totpRequired bool) User {
+	t.Helper()
+	hash, err := bcrypt.GenerateFromPassword([]byte("correct-horse-battery"), bcrypt.MinCost)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return User{ID: "admin-id", Username: "admin", PasswordHash: string(hash), Role: "admin", TOTPRequired: totpRequired}
 }

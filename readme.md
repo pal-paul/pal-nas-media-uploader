@@ -1,12 +1,18 @@
 # NAS Media Uploader
 
-Go API for authenticated, resumable media uploads. Authentication uses an
-administrator password followed by TOTP. Uploads are transferred in 8 MiB
-parts, assembled, checksum-verified, and recorded in PostgreSQL.
+Go API for multi-user, resumable media uploads. Administrators manage accounts;
+regular users upload into their own folders and can share their current and
+future media library with other regular users. Managed accounts use TOTP.
+
+The full backend entrypoint is [`cmd/server`](cmd/server). Container images run
+it as `/app/pal-media-server`; the existing Compose service remains named
+`uploader` for deployment compatibility. The upload-specific implementation
+continues to live under `app/uploader`.
 
 ## Requirements
 
 - Docker with Docker Compose
+- An amd64 or arm64 NAS/host
 - A TOTP authenticator application
 - `curl`, `jq`, `file`, `shasum`, and `split` for the API examples
 
@@ -18,10 +24,9 @@ Create the environment file and replace the example passwords:
 cp .env.example .env
 ```
 
-The initial administrator is created from `ENV_ADMIN_USERNAME` and
-`ENV_ADMIN_PASSWORD` only when the users table is empty. The password must be
-at least 12 characters. Changing these values later does not update an existing
-user.
+`ENV_ADMIN_USERNAME` and `ENV_ADMIN_PASSWORD` are bootstrap credentials used
+only by the one-time `/setup` form; they are never stored as an account. The
+bootstrap password must contain at least 12 characters.
 
 Start the API and PostgreSQL:
 
@@ -29,8 +34,27 @@ Start the API and PostgreSQL:
 docker compose --env-file .env -f build/compose.yaml up --build
 ```
 
-The example configuration exposes the API at `http://localhost:8081`. Change
-`ENV_PORT` in `.env` if that port is occupied.
+The example configuration exposes the gallery and API at
+`http://127.0.0.1:8081`. Change `ENV_PORT` in `.env` if that port is occupied.
+
+Open `http://localhost:8081/setup`, enter the bootstrap credentials, and choose
+the permanent administrator username and password. The page returns `404`
+after the first administrator is created. On first login, that administrator
+must scan the returned TOTP provisioning URI and verify a current code.
+
+After setup, open `http://127.0.0.1:8081/` to sign in to the gallery. Set
+`ENV_ADMIN_CONFIG=NO` and restart to disable only the administrator account
+configuration page. The gallery, setup lifecycle, and authenticated JSON APIs
+remain available. Set it back to `YES` and restart to create or manage users in
+the browser.
+
+For a local source build, run `npm ci && npm run build` in `web` before starting
+the Go server. `ENV_WEB_DIR` defaults to `./web/dist`; the container image builds
+and installs this directory automatically.
+
+Automatic albums are reconciled nightly. Configure `ENV_AUTO_ALBUM_RUN_AT`
+(default `02:00`) and `ENV_AUTO_ALBUM_TIMEZONE` (for example,
+`Europe/Stockholm`) in `.env` to choose the local run time.
 
 Stop the services while retaining uploaded media and database data:
 
@@ -42,8 +66,10 @@ Add `--volumes` only when you intentionally want to delete all local data.
 
 ## Authentication
 
-Only `POST /auth/login` and `POST /auth/verify` are public. All other endpoints
-require the `pal_medias_uploader_session` cookie.
+`GET /setup`, `POST /setup`, `POST /auth/login`, and `POST /auth/verify` are
+public. Setup is available only before the first account exists and while
+frontend pages are enabled. All other endpoints require the
+`pal_medias_uploader_session` cookie and enforce the account role.
 
 Set values used by the examples:
 
@@ -54,7 +80,9 @@ USERNAME=admin
 PASSWORD='your-admin-password'
 ```
 
-Begin login:
+Begin login as the configured administrator. On first login, the response also
+contains `provisioningUri` and `secret`; scan either with the administrator's
+authenticator:
 
 ```bash
 LOGIN_RESPONSE=$(curl -fsS \
@@ -64,14 +92,38 @@ LOGIN_RESPONSE=$(curl -fsS \
     --arg password "$PASSWORD" \
     '{username:$username,password:$password}')" \
   "$BASE_URL/auth/login")
-
 echo "$LOGIN_RESPONSE" | jq
-CHALLENGE_TOKEN=$(echo "$LOGIN_RESPONSE" | jq -r '.challengeToken')
 ```
 
-On the first login, the response also contains `provisioningUri` and `secret`.
-Add either value to your authenticator application. Later logins return only
-`challengeToken`.
+Continue with the TOTP verification steps below to save the session cookie.
+Then open `http://localhost:8081/admin/config` in a browser, or use
+the API to create a managed administrator and at least one regular test user:
+
+```bash
+curl -fsS -b "$COOKIE_JAR" \
+  -H 'Content-Type: application/json' \
+  -d "$(jq -n \
+    --arg username alice \
+    --arg password replace-with-12-chars \
+    '{username:$username,password:$password,
+      role:"user",uploadFolder:"alice"}')" \
+  "$BASE_URL/admin/users" | jq
+```
+
+The creation response contains a one-time `qrCode` data URI and
+`provisioningUri`. Scan either with the new user's authenticator. Accounts
+created here, including additional administrators, require TOTP.
+
+For any account, begin login and capture its challenge:
+
+```bash
+LOGIN_RESPONSE=$(curl -fsS \
+  -H 'Content-Type: application/json' \
+  -d "$(jq -n --arg username "$USERNAME" --arg password "$PASSWORD" \
+    '{username:$username,password:$password}')" \
+  "$BASE_URL/auth/login")
+CHALLENGE_TOKEN=$(echo "$LOGIN_RESPONSE" | jq -r '.challengeToken')
+```
 
 Verify a current six-digit TOTP code and save the session cookie:
 
@@ -95,6 +147,13 @@ curl -fsS -b "$COOKIE_JAR" "$BASE_URL/auth/session" | jq
 ```
 
 ## Upload media
+
+Upload endpoints accept regular-user sessions only. Completed paths are placed
+under that user's configured folder. Active sessions and pending bytes are
+limited per user by `ENV_MAX_ACTIVE_UPLOADS_PER_USER` and
+`ENV_MAX_PENDING_UPLOAD_BYTES_PER_USER`. The completed-plus-pending total is
+limited by `ENV_MAX_STORAGE_BYTES_PER_USER`. `ENV_HTTP_READ_TIMEOUT` bounds
+the time allowed to receive each request body.
 
 Choose a real media file and calculate its metadata:
 
@@ -169,16 +228,56 @@ curl -fsS -X DELETE -b "$COOKIE_JAR" \
   "$BASE_URL/media/upload/$UPLOAD_ID" | jq
 ```
 
+## Share media
+
+List files owned by or shared with the current regular user:
+
+```bash
+curl -fsS -b "$COOKIE_JAR" "$BASE_URL/media" | jq
+```
+
+An owner can use any active completed upload to share their entire library with
+another regular user. Existing media becomes available immediately, future
+uploads are included automatically, and nightly automatic albums use the
+recipient's full accessible library:
+
+```bash
+curl -fsS -X POST -b "$COOKIE_JAR" -H 'Content-Type: application/json' \
+  -d '{"username":"bob"}' "$BASE_URL/media/files/$UPLOAD_ID/shares"
+
+curl -fsS -b "$COOKIE_JAR" -OJ "$BASE_URL/media/files/$UPLOAD_ID/download"
+```
+
 ## API endpoints
 
 <!-- markdownlint-disable MD013 -->
 
 | Method   | Path                              | Authentication | Purpose                                  |
 | -------- | --------------------------------- | -------------- | ---------------------------------------- |
+| `GET`    | `/setup`                          | Public         | Open one-time administrator setup        |
+| `POST`   | `/setup`                          | Public         | Create the first administrator           |
 | `POST`   | `/auth/login`                     | Public         | Create a password and TOTP challenge     |
 | `POST`   | `/auth/verify`                    | Public         | Verify TOTP and issue a session cookie   |
 | `GET`    | `/auth/session`                   | Cookie         | Return the authenticated username        |
 | `POST`   | `/auth/logout`                    | Cookie         | Delete the session and expire the cookie |
+| `GET`    | `/admin/config`                   | Admin          | Open the user configuration page         |
+| `GET`    | `/admin/users`                    | Admin          | List users                               |
+| `POST`   | `/admin/users`                    | Admin          | Create a TOTP-enabled account            |
+| `PUT`    | `/users/me/folder`                | Regular user   | Change the user's upload folder          |
+| `GET`    | `/media`                          | Authenticated  | List owned and shared media              |
+| `GET`    | `/media/files/{id}/download`      | Authenticated  | Download accessible media                |
+| `POST`   | `/media/files/{id}/shares`        | Owner          | Share the owner's media library          |
+| `DELETE` | `/media/files/{id}/shares`        | Owner          | Remove the `?username=bob` library share |
+| `PATCH`  | `/media/files/{id}/favorite`      | Authenticated  | Set a personal favorite state            |
+| `DELETE` | `/media/files/{id}`               | Owner          | Move owned media to trash                |
+| `PATCH`  | `/media/files/{id}/restore`       | Owner          | Restore owned media                      |
+| `DELETE` | `/media/files/{id}/permanent`     | Owner          | Delete owned media and its thumbnail     |
+| `GET`    | `/albums`                         | Authenticated  | List owned albums                        |
+| `POST`   | `/albums`                         | Authenticated  | Create an album                          |
+| `GET`    | `/albums/{albumId}`               | Authenticated  | Get an album and accessible media        |
+| `PATCH`  | `/albums/{albumId}`               | Owner          | Update an album                          |
+| `DELETE` | `/albums/{albumId}`               | Owner          | Delete an album                          |
+| `GET`    | `/storage`                        | Authenticated  | Get accessible media totals              |
 | `POST`   | `/media/upload`                   | Cookie         | Create a resumable upload                |
 | `GET`    | `/media/upload/{id}`              | Cookie         | List uploaded parts                      |
 | `PUT`    | `/media/upload/{id}/parts/{part}` | Cookie         | Upload or replace one part               |
@@ -188,7 +287,13 @@ curl -fsS -X DELETE -b "$COOKIE_JAR" \
 <!-- markdownlint-enable MD013 -->
 
 The complete OpenAPI 3.1 contract is in
-[spec/openapi.yaml](spec/openapi.yaml).
+[spec/openapi.yaml](spec/openapi.yaml). Domain boundaries, multi-user ownership,
+and the complete gallery route set are described in
+[docs/backend-api.md](docs/backend-api.md).
+
+Synology Container Manager deployment, reverse-proxy, health monitoring,
+backup, restore, and integrity procedures are documented in
+[docs/synology.md](docs/synology.md).
 
 ## Development checks
 

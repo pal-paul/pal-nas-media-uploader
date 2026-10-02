@@ -4,4 +4,6 @@
 .env
 build
 vol
+**/node_modules
+web/dist
 **/*_test.go
