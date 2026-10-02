@@ -5,7 +5,7 @@ import (
 	"errors"
 	"time"
 
-	"pal-nas-media-uploader/app/publicshare"
+	"pal-next-gallery-server/app/publicshare"
 )
 
 func (store *Postgres) CreatePublicLink(ctx context.Context, link publicshare.Link, mediaID, albumID string) error {

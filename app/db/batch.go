@@ -4,7 +4,7 @@ import (
 	"context"
 	"errors"
 
-	"pal-nas-media-uploader/app/batch"
+	"pal-next-gallery-server/app/batch"
 )
 
 func (store *Postgres) CreateUploadBatch(ctx context.Context, item batch.Batch) error {

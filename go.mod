@@ -1,4 +1,4 @@
-module pal-nas-media-uploader
+module pal-next-gallery-server
 
 go 1.26.6
 

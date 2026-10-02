@@ -3,7 +3,7 @@ package store
 import (
 	"context"
 
-	setupapp "pal-nas-media-uploader/app/setup"
+	setupapp "pal-next-gallery-server/app/setup"
 )
 
 func (store *Postgres) SetupComplete(ctx context.Context) (bool, error) {

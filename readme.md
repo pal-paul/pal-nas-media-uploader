@@ -1,4 +1,4 @@
-# NAS Media Uploader
+# PAL Next Gallery Server
 
 Go API for multi-user, resumable media uploads. Administrators manage accounts;
 regular users upload into their own folders and can share their current and

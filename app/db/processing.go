@@ -6,7 +6,7 @@ import (
 	"errors"
 	"time"
 
-	"pal-nas-media-uploader/app/processing"
+	"pal-next-gallery-server/app/processing"
 
 	"github.com/jackc/pgx/v5"
 )

@@ -8,7 +8,7 @@
 .DS_Store
 
 # Go build and test output
-/pal-nas-media-uploader
+/pal-next-gallery-server
 *.test
 *.out
 coverage.*

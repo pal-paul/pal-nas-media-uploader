@@ -4,7 +4,7 @@ import (
 	"context"
 	"errors"
 
-	"pal-nas-media-uploader/app/autoalbum"
+	"pal-next-gallery-server/app/autoalbum"
 
 	"github.com/jackc/pgx/v5"
 )
