@@ -8,8 +8,8 @@ require (
 	github.com/jackc/pgx/v5 v5.11.0
 	github.com/pal-paul/go-libraries v1.0.3
 	github.com/pquerna/otp v1.5.0
-	golang.org/x/crypto v0.48.0
-	golang.org/x/sys v0.41.0
+	golang.org/x/crypto v0.57.0
+	golang.org/x/sys v0.48.0
 )
 
 require (
@@ -41,8 +41,8 @@ require (
 	github.com/ugorji/go/codec v1.3.1 // indirect
 	go.mongodb.org/mongo-driver/v2 v2.5.0 // indirect
 	golang.org/x/arch v0.22.0 // indirect
-	golang.org/x/net v0.51.0 // indirect
-	golang.org/x/sync v0.21.0 // indirect
-	golang.org/x/text v0.39.0 // indirect
+	golang.org/x/net v0.58.0 // indirect
+	golang.org/x/sync v0.23.0 // indirect
+	golang.org/x/text v0.42.0 // indirect
 	google.golang.org/protobuf v1.36.11 // indirect
 )
