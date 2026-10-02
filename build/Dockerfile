@@ -1,5 +1,16 @@
 ARG GO_IMAGE=golang:1.26.6-alpine
+ARG NODE_IMAGE=node:24-alpine
 ARG RUNTIME_IMAGE=alpine:3.23
+
+FROM ${NODE_IMAGE} AS web-builder
+
+WORKDIR /src/web
+
+COPY web/package.json web/package-lock.json ./
+RUN npm ci
+
+COPY web ./
+RUN npm run build
 
 FROM ${GO_IMAGE} AS builder
 
@@ -29,6 +40,7 @@ USER uploader
 WORKDIR /app
 
 COPY --from=builder /out/pal-media-server /app/pal-media-server
+COPY --from=web-builder /src/web/dist /app/web/dist
 
 EXPOSE ${ENV_PORT}
 

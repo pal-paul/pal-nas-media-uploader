@@ -71,24 +71,13 @@ func (service *Service) ResetPassword(ctx context.Context, actorRole, userID, pa
 }
 
 type Service struct {
-	repository    Repository
-	issuer        string
-	mediaDir      string
-	frontendPages bool
+	repository Repository
+	issuer     string
+	mediaDir   string
 }
 
-type Option func(*Service)
-
-func WithFrontendPages(enabled bool) Option {
-	return func(service *Service) { service.frontendPages = enabled }
-}
-
-func NewService(repository Repository, issuer, mediaDir string, options ...Option) *Service {
-	service := &Service{repository: repository, issuer: issuer, mediaDir: filepath.Clean(mediaDir), frontendPages: true}
-	for _, option := range options {
-		option(service)
-	}
-	return service
+func NewService(repository Repository, issuer, mediaDir string) *Service {
+	return &Service{repository: repository, issuer: issuer, mediaDir: filepath.Clean(mediaDir)}
 }
 
 func (service *Service) CreateAccount(ctx context.Context, actorRole, username, password, role, folder string) (Account, string, error) {

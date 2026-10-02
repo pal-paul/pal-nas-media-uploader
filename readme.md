@@ -26,8 +26,7 @@ cp .env.example .env
 
 `ENV_ADMIN_USERNAME` and `ENV_ADMIN_PASSWORD` are bootstrap credentials used
 only by the one-time `/setup` form; they are never stored as an account. The
-bootstrap password must contain at least 12 characters. Keep
-`ENV_FRONTEND_PAGES_ENABLED=YES` for initial setup.
+bootstrap password must contain at least 12 characters.
 
 Start the API and PostgreSQL:
 
@@ -35,17 +34,23 @@ Start the API and PostgreSQL:
 docker compose --env-file .env -f build/compose.yaml up --build
 ```
 
-The example configuration exposes the API at `http://localhost:8081`. Change
-`ENV_PORT` in `.env` if that port is occupied.
+The example configuration exposes the gallery and API at
+`http://127.0.0.1:8081`. Change `ENV_PORT` in `.env` if that port is occupied.
 
 Open `http://localhost:8081/setup`, enter the bootstrap credentials, and choose
 the permanent administrator username and password. The page returns `404`
 after the first administrator is created. On first login, that administrator
 must scan the returned TOTP provisioning URI and verify a current code.
 
-Set `ENV_FRONTEND_PAGES_ENABLED=NO` and restart to disable both `/setup` and
-`/admin/config`. Authenticated JSON endpoints remain available. Set it back to
-`YES` and restart whenever the administrator configuration page is needed.
+After setup, open `http://127.0.0.1:8081/` to sign in to the gallery. Set
+`ENV_ADMIN_CONFIG=NO` and restart to disable only the administrator account
+configuration page. The gallery, setup lifecycle, and authenticated JSON APIs
+remain available. Set it back to `YES` and restart to create or manage users in
+the browser.
+
+For a local source build, run `npm ci && npm run build` in `web` before starting
+the Go server. `ENV_WEB_DIR` defaults to `./web/dist`; the container image builds
+and installs this directory automatically.
 
 Automatic albums are reconciled nightly. Configure `ENV_AUTO_ALBUM_RUN_AT`
 (default `02:00`) and `ENV_AUTO_ALBUM_TIMEZONE` (for example,

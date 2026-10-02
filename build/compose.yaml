@@ -27,6 +27,7 @@ services:
       dockerfile: ${DOCKERFILE_PATH}
       args:
         GO_IMAGE: ${GO_IMAGE}
+        NODE_IMAGE: ${NODE_IMAGE:-node:24-alpine}
         RUNTIME_IMAGE: ${RUNTIME_IMAGE}
         ENV_MEDIA_DIR: ${ENV_MEDIA_DIR}
         ENV_TMP_DIR: ${ENV_TMP_DIR}

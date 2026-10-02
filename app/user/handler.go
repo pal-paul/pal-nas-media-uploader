@@ -31,10 +31,6 @@ func (service *Service) RequireRole(role string) gin.HandlerFunc {
 }
 
 func (service *Service) ConfigurationPage(context *gin.Context) {
-	if !service.frontendPages {
-		context.Status(http.StatusNotFound)
-		return
-	}
 	context.Header("Content-Type", "text/html; charset=utf-8")
 	if err := configurationTemplate.ExecuteTemplate(context.Writer, "config.html", nil); err != nil {
 		internalError(context, err)
@@ -42,10 +38,6 @@ func (service *Service) ConfigurationPage(context *gin.Context) {
 }
 
 func (service *Service) MediaPage(context *gin.Context) {
-	if !service.frontendPages {
-		context.Status(http.StatusNotFound)
-		return
-	}
 	context.Header("Content-Type", "text/html; charset=utf-8")
 	if err := configurationTemplate.ExecuteTemplate(context.Writer, "media.html", nil); err != nil {
 		internalError(context, err)

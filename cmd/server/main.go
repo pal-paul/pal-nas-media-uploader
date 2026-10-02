@@ -6,6 +6,7 @@ import (
 	"log/slog"
 	"net/http"
 	"net/netip"
+	"net/url"
 	"os"
 	"os/signal"
 	"strings"
@@ -16,6 +17,7 @@ import (
 	"pal-nas-media-uploader/app/autoalbum"
 	"pal-nas-media-uploader/app/batch"
 	store "pal-nas-media-uploader/app/db"
+	"pal-nas-media-uploader/app/frontend"
 	"pal-nas-media-uploader/app/gallery"
 	"pal-nas-media-uploader/app/operations"
 	"pal-nas-media-uploader/app/processing"
@@ -38,12 +40,13 @@ var (
 
 type Environment struct {
 	Mode string `env:"ENV_GIN_MODE,default=release"`
-	Port string `env:"ENV_PORT,default=8080"`
+	Port string `env:"ENV_PORT,default=8081"`
 
 	DatabaseURL     string `env:"ENV_DATABASE_URL"`
 	AdminUsername   string `env:"ENV_ADMIN_USERNAME"`
 	AdminPassword   string `env:"ENV_ADMIN_PASSWORD"`
-	FrontendPages   string `env:"ENV_FRONTEND_PAGES_ENABLED,default=YES"`
+	AdminConfig     string `env:"ENV_ADMIN_CONFIG,default=YES"`
+	WebDir          string `env:"ENV_WEB_DIR,default=./web/dist"`
 	MediaDir        string `env:"ENV_MEDIA_DIR,default=./vol/medias"`
 	TmpDir          string `env:"ENV_TMP_DIR,default=./vol/tmp"`
 	MaxUploadSize   int64  `env:"ENV_MAX_UPLOAD_SIZE_BYTES,default=107374182400"`
@@ -110,11 +113,15 @@ func run() error {
 	}
 
 	authService := auth.NewService(database, envVar.Issuer, auth.WithTrustedProxies(trustedProxies))
-	frontendPagesEnabled, err := parseYesNo(envVar.FrontendPages)
+	adminConfigEnabled, err := parseYesNo(envVar.AdminConfig)
 	if err != nil {
 		return err
 	}
-	setupService, err := setupapp.NewService(database, envVar.AdminUsername, envVar.AdminPassword, frontendPagesEnabled)
+	frontendService, err := frontend.New(envVar.WebDir)
+	if err != nil {
+		return err
+	}
+	setupService, err := setupapp.NewService(database, envVar.AdminUsername, envVar.AdminPassword, true)
 	if err != nil {
 		return fmt.Errorf("create setup service: %w", err)
 	}
@@ -136,7 +143,7 @@ func run() error {
 	if err != nil {
 		return fmt.Errorf("create uploader service: %w", err)
 	}
-	userService := userapp.NewService(database, envVar.Issuer, envVar.MediaDir, userapp.WithFrontendPages(frontendPagesEnabled))
+	userService := userapp.NewService(database, envVar.Issuer, envVar.MediaDir)
 	galleryService := gallery.NewService(database, envVar.MediaDir)
 	operationsService, err := operations.New(database, uploaderService, envVar.MediaDir, envVar.TmpDir, envVar.MinDiskFree)
 	if err != nil {
@@ -161,6 +168,7 @@ func run() error {
 	router.Use(gin.Recovery(), requestLoggerMiddleware())
 	router.Use(securityHeadersMiddleware())
 	router.Use(corsMiddleware(envVar.AllowedOrigins))
+	frontendService.RegisterRoutes(router)
 	router.GET("/healthz", operationsService.Liveness)
 	router.GET("/readyz", operationsService.Readiness)
 	setupService.RegisterRoutes(router)
@@ -178,7 +186,9 @@ func run() error {
 
 	adminRoutes := protected.Group("/admin")
 	adminRoutes.Use(userService.RequireRole("admin"))
-	adminRoutes.GET("/config", userService.ConfigurationPage)
+	if adminConfigEnabled {
+		adminRoutes.GET("/config", userService.ConfigurationPage)
+	}
 	adminRoutes.GET("/users", userService.ListUsers)
 	adminRoutes.POST("/users", userService.CreateUser)
 	adminRoutes.PATCH("/users/:id/password", userService.ResetUserPassword)
@@ -313,7 +323,7 @@ func parseYesNo(value string) (bool, error) {
 	case "NO":
 		return false, nil
 	default:
-		return false, fmt.Errorf("ENV_FRONTEND_PAGES_ENABLED must be YES or NO")
+		return false, fmt.Errorf("ENV_ADMIN_CONFIG must be YES or NO")
 	}
 }
 
@@ -372,7 +382,9 @@ func corsMiddleware(allowedOrigins string) gin.HandlerFunc {
 	}
 	return func(c *gin.Context) {
 		origin := c.GetHeader("Origin")
-		if _, ok := allowed[origin]; origin != "" && !ok {
+		_, explicitlyAllowed := allowed[origin]
+		nullSameOrigin := origin == "null" && c.GetHeader("Sec-Fetch-Site") == "same-origin"
+		if origin != "" && !explicitlyAllowed && !nullSameOrigin && !isSameOrigin(origin, c.Request.Host) {
 			c.AbortWithStatus(http.StatusForbidden)
 			return
 		}
@@ -391,4 +403,9 @@ func corsMiddleware(allowedOrigins string) gin.HandlerFunc {
 
 		c.Next()
 	}
+}
+
+func isSameOrigin(origin, requestHost string) bool {
+	parsed, err := url.Parse(origin)
+	return err == nil && (parsed.Scheme == "http" || parsed.Scheme == "https") && parsed.Host == requestHost
 }

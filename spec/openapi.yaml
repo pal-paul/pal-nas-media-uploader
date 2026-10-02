@@ -63,8 +63,10 @@ info:
     - `ENV_DATABASE_URL` is the required PostgreSQL connection URL.
     - `ENV_ADMIN_USERNAME` and `ENV_ADMIN_PASSWORD` authorize one-time setup;
       the bootstrap password must contain at least 12 characters.
-    - `ENV_FRONTEND_PAGES_ENABLED` is `YES` or `NO` and controls only the
-      built-in `/setup` and `/admin/config` HTML pages. JSON APIs remain active.
+    - `ENV_ADMIN_CONFIG` is `YES` or `NO` and controls only the administrator
+      account page at `/admin/config`. Setup, gallery, and JSON APIs remain active.
+    - `ENV_WEB_DIR` selects the gallery production build and defaults to
+      `./web/dist`.
     - `ENV_MEDIA_DIR` and `ENV_TMP_DIR` select completed-media and active-upload
       storage roots.
     - `ENV_MAX_UPLOAD_SIZE_BYTES` defaults to 100 GiB.
@@ -164,10 +166,9 @@ paths:
       operationId: initialSetupPage
       summary: Open one-time administrator setup
       description: |
-        Renders an embedded HTML form. The route is available only while
-        `ENV_FRONTEND_PAGES_ENABLED=YES` and the users table is empty. It returns
-        `404` after any account exists, so setup completion requires no separate
-        state flag.
+        Renders an embedded HTML form. The route is available only while the
+        users table is empty. It returns `404` after any account exists, so setup
+        completion requires no separate state flag.
       security: []
       responses:
         "200":
@@ -380,7 +381,7 @@ paths:
       tags: [Users]
       operationId: userConfigurationPage
       summary: Open the administrator configuration page
-      description: Requires an administrator session. The embedded HTML page calls `/admin/users`; disabling frontend pages does not disable those JSON endpoints.
+      description: Requires an administrator session and `ENV_ADMIN_CONFIG=YES`. The embedded HTML page calls `/admin/users`; disabling the page does not disable those JSON endpoints.
       responses:
         "200":
           description: User configuration HTML page.
@@ -391,7 +392,7 @@ paths:
         "403":
           $ref: "#/components/responses/Forbidden"
         "404":
-          description: Frontend pages are disabled.
+          description: Administrator configuration page is disabled.
   /admin/users:
     get:
       tags: [Users]

@@ -115,9 +115,9 @@ after installation. Backup and restore procedures are documented in
 
 ## Base URL and authentication
 
-The default local URL is `http://localhost:8081`. The one-time `/setup` routes
-and the authentication routes are public. All other routes require the
-`pal_medias_uploader_session` cookie.
+The default local URL is `http://127.0.0.1:8081`. `GET /` serves the gallery
+application. The one-time `/setup` routes and the authentication routes are
+public. All other routes require the `pal_medias_uploader_session` cookie.
 
 Browser requests must include credentials:
 
@@ -125,15 +125,17 @@ Browser requests must include credentials:
 await fetch(`${baseUrl}/albums`, { credentials: "include" });
 ```
 
-Administrators manage accounts but cannot upload or use gallery routes. Regular
-users can upload and use the gallery. Accounts created by an administrator use
-password plus TOTP. Environment bootstrap credentials authorize only the
-one-time setup form and are never stored as a login account. The first
-persistent administrator enrolls TOTP on first login.
+Administrators manage accounts and can use gallery routes, including access to
+migrated legacy media, but cannot upload. Regular users can upload and use the
+gallery. Accounts created by an administrator use password plus TOTP.
+Environment bootstrap credentials authorize only the one-time setup form and
+are never stored as a login account. The first persistent administrator enrolls
+TOTP on first login.
 
-`ENV_FRONTEND_PAGES_ENABLED=YES` serves `/setup`, `/admin/config`, and
-`/media/app`; `NO` returns `404` for those HTML pages without disabling the
-JSON APIs.
+`ENV_ADMIN_CONFIG=YES` serves the administrator account page at
+`/admin/config`; `NO` makes only that page unavailable without disabling setup,
+the gallery, or JSON APIs. `ENV_WEB_DIR` defaults to `./web/dist` and selects
+the gallery production build.
 
 ## Endpoint summary
 
