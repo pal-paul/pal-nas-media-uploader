@@ -4,7 +4,7 @@ import (
 	"context"
 	"time"
 
-	"pal-nas-media-uploader/app/trash"
+	"pal-next-gallery-server/app/trash"
 )
 
 func (store *Postgres) ListExpiredTrash(ctx context.Context, now time.Time, limit int) ([]trash.ExpiredMedia, error) {

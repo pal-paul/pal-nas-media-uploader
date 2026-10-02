@@ -4,7 +4,7 @@ import (
 	"context"
 	"errors"
 
-	userapp "pal-nas-media-uploader/app/user"
+	userapp "pal-next-gallery-server/app/user"
 )
 
 func (store *Postgres) CreateUser(ctx context.Context, account userapp.NewAccount) error {

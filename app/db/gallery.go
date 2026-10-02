@@ -5,7 +5,7 @@ import (
 	"errors"
 	"strings"
 
-	"pal-nas-media-uploader/app/gallery"
+	"pal-next-gallery-server/app/gallery"
 
 	"github.com/jackc/pgx/v5"
 )

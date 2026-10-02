@@ -6,7 +6,7 @@ import (
 	"strings"
 	"time"
 
-	"pal-nas-media-uploader/app/auth"
+	"pal-next-gallery-server/app/auth"
 
 	"github.com/gin-gonic/gin"
 	"github.com/google/uuid"

@@ -4,7 +4,7 @@ import (
 	"context"
 	"errors"
 
-	"pal-nas-media-uploader/app/transfer"
+	"pal-next-gallery-server/app/transfer"
 
 	"github.com/google/uuid"
 )

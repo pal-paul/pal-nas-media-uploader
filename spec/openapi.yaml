@@ -1,6 +1,6 @@
 openapi: 3.1.0
 info:
-  title: PAL NAS Media Uploader API
+  title: PAL Next Gallery Server API
   version: 1.0.0
   description: |
     Backend API for a self-hosted, multi-user NAS media library.

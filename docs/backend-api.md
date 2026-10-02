@@ -59,56 +59,50 @@ it does not implement file transfer again.
 
 ## Synology NAS quick install
 
-This deployment uses Synology Container Manager and bind-mounts all persistent
-data under `/volume1/docker/pal-media`. It supports amd64 and arm64 NAS models.
+This deployment uses Synology Container Manager and the published amd64/arm64
+image. PostgreSQL data stays under `/volume1/docker/next-gallery-server`, while
+media and incomplete uploads use separate bind mounts.
 
 1. Install **Container Manager** from DSM Package Center and enable SSH
    temporarily in **Control Panel > Terminal & SNMP**.
-2. Copy or clone this repository onto the NAS, open an SSH session, and change
-   to the repository root.
+2. Copy `build/compose.synology.yaml` onto the NAS, open an SSH session, and
+  change to its parent repository directory.
 3. Create the persistent directories:
 
 ```sh
-mkdir -p /volume1/docker/pal-media/{postgres,media,tmp,backups}
+mkdir -p /volume1/docker/next-gallery-server/{postgres,backups} \
+  /volume1/media/{gallery,tmp}
 ```
 
-1. Create the environment file and edit it before starting containers:
+1. Replace every `<change-me>` in `build/compose.synology.yaml`. Keep the
+  PostgreSQL credentials in `ENV_DATABASE_URL` identical to the `postgres`
+  service values. The bootstrap administrator password must be at least 12
+  characters. Set `ENV_CORS_ALLOWED_ORIGINS` to the external HTTPS origin if
+  DSM reverse proxy will be used.
+
+1. Pull and start the Container Manager project:
 
 ```sh
-cp .env.example .env
-chmod 600 .env
-```
-
-At minimum, replace `POSTGRES_PASSWORD` and `ENV_ADMIN_PASSWORD`. The
-bootstrap administrator password must be at least 12 characters. Confirm
-`NAS_POSTGRES_PATH`, `NAS_MEDIA_PATH`, and `NAS_UPLOAD_TMP_PATH` point to the
-volume created above. If DSM reverse proxy will be used, set
-`ENV_CORS_ALLOWED_ORIGINS` to its external HTTPS origin.
-
-1. Build and start the Container Manager project:
-
-```sh
-docker compose --env-file .env \
-  -f build/compose.yaml -f build/compose.synology.yaml \
-  up -d --build
+docker compose -f build/compose.synology.yaml pull
+docker compose -f build/compose.synology.yaml up -d
 ```
 
 1. Wait for PostgreSQL and the media server to become healthy, then verify:
 
 ```sh
-docker compose --env-file .env \
-  -f build/compose.yaml -f build/compose.synology.yaml ps
-curl -fsS http://127.0.0.1:8081/readyz
+docker compose -f build/compose.synology.yaml ps
+curl -fsS http://127.0.0.1:8013/readyz
 ```
 
-1. Open `http://NAS-IP:8081/setup`, enter the bootstrap credentials from
-   `.env`, and create the permanent administrator. Enroll its TOTP token on
-   first login. Then use `/admin/config` to create regular users.
+1. Open `http://NAS-IP:8013/setup`, enter the bootstrap credentials from
+  `build/compose.synology.yaml`, and create the permanent administrator.
+  Enroll its TOTP token on first login. Then use `/admin/config` to create
+  regular users.
 
 The application container runs as a non-root user. Ensure the Container
 Manager project has read/write permission to the three bind-mounted folders if
 readiness reports a storage error. For HTTPS, configure DSM **Login Portal >
-Advanced > Reverse Proxy**, forward to port `8081`, and set
+Advanced > Reverse Proxy**, forward to port `8013`, and set
 `ENV_TRUSTED_PROXIES` to the DSM proxy source address or CIDR. Disable SSH again
 after installation. Backup and restore procedures are documented in
 [Synology deployment and operations](synology.md).

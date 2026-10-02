@@ -6,18 +6,23 @@ Create these directories from DSM File Station or SSH and restrict them to the
 account used by Container Manager:
 
 ```text
-/volume1/docker/pal-media/postgres
-/volume1/docker/pal-media/media
-/volume1/docker/pal-media/tmp
-/volume1/docker/pal-media/backups
+/volume1/docker/next-gallery-server/postgres
+/volume1/docker/next-gallery-server/backups
+/volume1/media/gallery
+/volume1/media/tmp
 ```
 
-Copy `.env.example` to `.env`, replace both passwords, and adjust the three
-`NAS_*_PATH` values if a different volume is used. Deploy both Compose files:
+Edit `build/compose.synology.yaml` and replace every `<change-me>` value. The
+PostgreSQL username and password in `ENV_DATABASE_URL` must match the values on
+the `postgres` service. Also set the external HTTPS origin and trusted proxy if
+DSM reverse proxy is used.
+
+The Synology Compose file contains all settings and does not require a `.env`
+file. Deploy it as a Container Manager project, or from SSH:
 
 ```sh
-docker compose --env-file .env \
-  -f build/compose.yaml -f build/compose.synology.yaml up -d --build
+docker compose -f build/compose.synology.yaml pull
+docker compose -f build/compose.synology.yaml up -d
 ```
 
 Images are published for `linux/amd64` and `linux/arm64`. The application image
@@ -32,8 +37,8 @@ HTTPS origin. Set `ENV_TRUSTED_PROXIES` to the source address or CIDR from which
 DSM reaches the container. This value controls whether forwarded client IP and
 HTTPS headers are trusted; leave it empty when no reverse proxy is used.
 
-After changing `.env`, recreate the application container (Compose service
-`uploader`). Confirm the session cookie is marked `Secure` through the HTTPS
+After changing the Compose environment, recreate the application container
+(Compose service `server`). Confirm the session cookie is marked `Secure` through the HTTPS
 endpoint.
 
 ## Monitoring
@@ -61,7 +66,7 @@ time. PostgreSQL continues running.
 
 ```sh
 COMPOSE_EXTRA="$PWD/build/compose.synology.yaml" \
-  ./scripts/backup.sh /volume1/docker/pal-media/backups
+  ./scripts/backup.sh /volume1/docker/next-gallery-server/backups
 ```
 
 Each timestamped backup contains `database.dump`, `media.tar.gz`,
@@ -76,7 +81,7 @@ trees, and then starts the application again:
 
 ```sh
 FORCE=YES COMPOSE_EXTRA="$PWD/build/compose.synology.yaml" \
-  ./scripts/restore.sh /volume1/docker/pal-media/backups/20261001T120000Z
+  ./scripts/restore.sh /volume1/docker/next-gallery-server/backups/20261001T120000Z
 ```
 
 After restore, require `GET /readyz` to return `200`, authenticate, and run

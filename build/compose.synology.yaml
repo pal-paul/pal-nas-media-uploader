@@ -1,9 +1,70 @@
+name: next-gallery-server
+
 services:
   postgres:
+    image: postgres:17-alpine
+    environment:
+      POSTGRES_DB: uploader
+      POSTGRES_USER: "<change-me>"
+      POSTGRES_PASSWORD: "<change-me>"
+    ports:
+      - "5510:5432"
     volumes:
-      - ${NAS_POSTGRES_PATH}:${POSTGRES_DATA_DIR}
+      - /volume1/docker/next-gallery-server/postgres:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U $${POSTGRES_USER} -d $${POSTGRES_DB}"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+    logging:
+      driver: json-file
+      options:
+        max-size: 10m
+        max-file: "5"
+    restart: unless-stopped
 
-  uploader:
+  server:
+    image: ghcr.io/pal-paul/pal-next-gallery-server:latest
+    environment:
+      ENV_GIN_MODE: release
+      ENV_PORT: "8081"
+      ENV_ADMIN_USERNAME: "<change-me>"
+      ENV_ADMIN_PASSWORD: "<change-me>"
+      ENV_ADMIN_CONFIG: "YES"
+      ENV_WEB_DIR: ./web/dist
+      ENV_DATABASE_URL: "postgres://<change-me>:<change-me>@postgres:5432/uploader?sslmode=disable"
+      ENV_MEDIA_DIR: /data/medias
+      ENV_TMP_DIR: /data/tmp
+      ENV_MAX_UPLOAD_SIZE_BYTES: "107374182400"
+      ENV_MAX_PENDING_UPLOAD_BYTES_PER_USER: "107374182400"
+      ENV_MAX_STORAGE_BYTES_PER_USER: "1099511627776"
+      ENV_MIN_DISK_FREE_BYTES: "2147483648"
+      ENV_MAX_ACTIVE_UPLOADS_PER_USER: "10"
+      ENV_HTTP_READ_TIMEOUT: 5m
+      ENV_CLEANUP_INTERVAL: 1h
+      ENV_UPLOAD_RETENTION: 168h
+      ENV_CORS_ALLOWED_ORIGINS: http://localhost:3000
+      ENV_TRUSTED_PROXIES: ""
+      ENV_ISSUER: "<change-me>"
+      ENV_AUTO_ALBUM_RUN_AT: "02:00"
+      ENV_AUTO_ALBUM_TIMEZONE: Europe/Stockholm
+    ports:
+      - "8013:8081"
     volumes:
-      - ${NAS_MEDIA_PATH}:${ENV_MEDIA_DIR}
-      - ${NAS_UPLOAD_TMP_PATH}:${ENV_TMP_DIR}
+      - /volume1/media/gallery:/data/medias
+      - /volume1/media/tmp:/data/tmp
+    depends_on:
+      postgres:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD", "wget", "-q", "-O", "/dev/null", "http://127.0.0.1:8081/readyz"]
+      interval: 30s
+      timeout: 5s
+      start_period: 15s
+      retries: 3
+    logging:
+      driver: json-file
+      options:
+        max-size: 10m
+        max-file: "5"
+    restart: unless-stopped

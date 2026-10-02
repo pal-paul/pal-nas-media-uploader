@@ -3,7 +3,7 @@ package processing
 import (
 	"net/http"
 
-	"pal-nas-media-uploader/app/auth"
+	"pal-next-gallery-server/app/auth"
 
 	"github.com/gin-gonic/gin"
 )

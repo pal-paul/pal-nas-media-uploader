@@ -28,20 +28,20 @@ compose() {
 	fi
 }
 
-restart_uploader() {
-	compose start uploader >/dev/null 2>&1 || true
+restart_server() {
+	compose start server >/dev/null 2>&1 || true
 }
-trap restart_uploader EXIT INT TERM
+trap restart_server EXIT INT TERM
 
-compose stop uploader >/dev/null
+compose stop server >/dev/null
 compose exec -T postgres pg_dump -U "$POSTGRES_USER" -d "$POSTGRES_DB" -Fc > "$BACKUP_DIR/database.dump"
 compose run --rm --no-deps --entrypoint sh \
-	-v "$BACKUP_DIR:/backup" uploader \
+	-v "$BACKUP_DIR:/backup" server \
 	-c 'tar -czf /backup/media.tar.gz -C "$ENV_MEDIA_DIR" . && tar -czf /backup/uploads.tar.gz -C "$ENV_TMP_DIR" .'
 cp "$ENV_FILE" "$BACKUP_DIR/environment.env"
 chmod 600 "$BACKUP_DIR/environment.env"
 (cd "$BACKUP_DIR" && sha256sum database.dump media.tar.gz uploads.tar.gz environment.env > SHA256SUMS)
 
 trap - EXIT INT TERM
-restart_uploader
+restart_server
 echo "Backup created: $BACKUP_DIR"

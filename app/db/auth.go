@@ -4,7 +4,7 @@ import (
 	"context"
 	"time"
 
-	"pal-nas-media-uploader/app/auth"
+	"pal-next-gallery-server/app/auth"
 )
 
 func (store *Postgres) ReplaceRecoveryCodes(ctx context.Context, userID string, hashes []string) error {

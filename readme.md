@@ -1,13 +1,12 @@
-# NAS Media Uploader
+# Next Gallery Server
 
 Go API for multi-user, resumable media uploads. Administrators manage accounts;
 regular users upload into their own folders and can share their current and
 future media library with other regular users. Managed accounts use TOTP.
 
 The full backend entrypoint is [`cmd/server`](cmd/server). Container images run
-it as `/app/pal-media-server`; the existing Compose service remains named
-`uploader` for deployment compatibility. The upload-specific implementation
-continues to live under `app/uploader`.
+it as `/app/pal-media-server`; the Compose service is named `server`. The
+upload-specific implementation continues to live under `app/uploader`.
 
 ## Requirements
 
