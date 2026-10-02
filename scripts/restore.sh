@@ -29,17 +29,17 @@ compose() {
 	fi
 }
 
-restart_uploader() {
-	compose start uploader >/dev/null 2>&1 || true
+restart_server() {
+	compose start server >/dev/null 2>&1 || true
 }
-trap restart_uploader EXIT INT TERM
+trap restart_server EXIT INT TERM
 
-compose stop uploader >/dev/null
+compose stop server >/dev/null
 compose exec -T postgres pg_restore -U "$POSTGRES_USER" -d "$POSTGRES_DB" --clean --if-exists < "$BACKUP_DIR/database.dump"
 compose run --rm --no-deps --entrypoint sh \
-	-v "$BACKUP_DIR:/backup:ro" uploader \
+	-v "$BACKUP_DIR:/backup:ro" server \
 	-c 'rm -rf "$ENV_MEDIA_DIR"/* "$ENV_MEDIA_DIR"/.[!.]* "$ENV_MEDIA_DIR"/..?*; tar -xzf /backup/media.tar.gz -C "$ENV_MEDIA_DIR"; rm -rf "$ENV_TMP_DIR"/* "$ENV_TMP_DIR"/.[!.]* "$ENV_TMP_DIR"/..?*; tar -xzf /backup/uploads.tar.gz -C "$ENV_TMP_DIR"'
 
 trap - EXIT INT TERM
-restart_uploader
+restart_server
 echo "Restore completed from: $BACKUP_DIR"

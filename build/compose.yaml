@@ -20,8 +20,8 @@ services:
         max-size: ${LOG_MAX_SIZE}
         max-file: "${LOG_MAX_FILES}"
 
-  uploader:
-    image: ${UPLOADER_IMAGE}
+  server:
+    image: ${SERVER_IMAGE}
     build:
       context: ${BUILD_CONTEXT}
       dockerfile: ${DOCKERFILE_PATH}
