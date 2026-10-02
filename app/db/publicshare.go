@@ -13,7 +13,9 @@ func (store *Postgres) CreatePublicLink(ctx context.Context, link publicshare.Li
 		(id, owner_id, media_id, album_id, password_hash, expires_at)
 		SELECT $1, $2, NULLIF($3, ''), NULLIF($4, '')::uuid, NULLIF($5, ''), $6
 		WHERE ($3 <> '' AND EXISTS (SELECT 1 FROM media_uploads WHERE upload_id = $3 AND owner_id = $2 AND deleted_at IS NULL))
-		OR ($4 <> '' AND EXISTS (SELECT 1 FROM albums WHERE id = $4 AND owner_id = $2))`,
+		OR ($4 <> '' AND EXISTS (SELECT 1 FROM albums album WHERE album.id = $4 AND album.owner_id = $2
+			AND NOT EXISTS (SELECT 1 FROM album_media item JOIN media_uploads media ON media.upload_id = item.upload_id
+				WHERE item.album_id = album.id AND media.owner_id <> $2)))`,
 		link.ID, link.OwnerID, mediaID, albumID, link.PasswordHash, link.ExpiresAt)
 	if err == nil && result.RowsAffected() == 0 {
 		return errors.New("owned share target not found")
@@ -46,7 +48,7 @@ func (store *Postgres) ResolvePublicLink(ctx context.Context, id string, now tim
 	}
 	rows, err := store.pool.Query(ctx, `SELECT media.filename, media.mime_type, media.media_path, media.size
 		FROM album_media item JOIN media_uploads media ON media.upload_id = item.upload_id
-		WHERE item.album_id = $1 AND media.deleted_at IS NULL ORDER BY item.added_at`, albumID)
+		WHERE item.album_id = $1 AND media.owner_id = $2 AND media.deleted_at IS NULL ORDER BY item.added_at`, albumID, link.OwnerID)
 	if err != nil {
 		return link, err
 	}

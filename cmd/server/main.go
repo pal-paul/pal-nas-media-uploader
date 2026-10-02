@@ -190,12 +190,14 @@ func run() error {
 	adminRoutes.POST("/processing-jobs/:id/retry", processingService.RetryJob)
 	adminRoutes.POST("/trash/cleanup", trashService.CleanupHandler)
 
+	protected.GET("/media/files/:id/download", userService.DownloadMedia)
+	protected.GET("/media/files/:id/thumbnail", userService.DownloadThumbnail)
+	gallery.RegisterRoutes(protected, galleryService)
+
 	userRoutes := protected.Group("/")
 	userRoutes.Use(userService.RequireRole("user"))
 	userRoutes.PUT("/users/me/folder", userService.SetMyFolder)
 	userRoutes.GET("/media/app", userService.MediaPage)
-	userRoutes.GET("/media/files/:id/download", userService.DownloadMedia)
-	userRoutes.GET("/media/files/:id/thumbnail", userService.DownloadThumbnail)
 	userRoutes.POST("/media/public-links", publicShareService.Create)
 	userRoutes.DELETE("/media/public-links/:id", publicShareService.Delete)
 	userRoutes.POST("/media/upload-batches", batchService.Create)
@@ -206,7 +208,6 @@ func run() error {
 	userRoutes.GET("/media/files/:id/processing-status", processingService.Status)
 	userRoutes.POST("/media/files/:id/shares", userService.ShareMedia)
 	userRoutes.DELETE("/media/files/:id/shares", userService.UnshareMedia)
-	gallery.RegisterRoutes(userRoutes, galleryService)
 	if err := uploader.RegisterRoutes(userRoutes, uploaderService); err != nil {
 		return fmt.Errorf("register uploader routes: %w", err)
 	}

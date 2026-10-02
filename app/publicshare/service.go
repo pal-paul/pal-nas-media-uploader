@@ -9,6 +9,7 @@ import (
 	"encoding/hex"
 	"errors"
 	"io"
+	"mime"
 	"net/http"
 	"os"
 	"path/filepath"
@@ -132,7 +133,7 @@ func (service *Service) Download(context *gin.Context) {
 			context.JSON(http.StatusNotFound, gin.H{"error": "shared file not found"})
 			return
 		}
-		context.Header("Content-Disposition", "attachment; filename=\""+strings.ReplaceAll(link.Files[0].Filename, "\"", "")+"\"")
+		context.Header("Content-Disposition", mime.FormatMediaType("attachment", map[string]string{"filename": link.Files[0].Filename}))
 		context.File(path)
 		return
 	}

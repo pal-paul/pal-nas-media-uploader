@@ -226,9 +226,6 @@ func (service *Service) Verify(ctx context.Context, challengeToken, code string)
 			return "", err
 		}
 		if !enabled {
-			if _, err := service.database.DeleteAuthChallenge(ctx, hash); err != nil {
-				return "", err
-			}
 			return "", ErrInvalidChallenge
 		}
 	}

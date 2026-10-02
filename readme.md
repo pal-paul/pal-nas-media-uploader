@@ -259,20 +259,20 @@ curl -fsS -b "$COOKIE_JAR" -OJ "$BASE_URL/media/files/$UPLOAD_ID/download"
 | `GET`    | `/admin/users`                    | Admin          | List users                               |
 | `POST`   | `/admin/users`                    | Admin          | Create a TOTP-enabled account            |
 | `PUT`    | `/users/me/folder`                | Regular user   | Change the user's upload folder          |
-| `GET`    | `/media`                          | Regular user   | List owned and shared media              |
-| `GET`    | `/media/files/{id}/download`      | Regular user   | Download owned or shared media           |
+| `GET`    | `/media`                          | Authenticated  | List owned and shared media              |
+| `GET`    | `/media/files/{id}/download`      | Authenticated  | Download accessible media                |
 | `POST`   | `/media/files/{id}/shares`        | Owner          | Share the owner's media library          |
 | `DELETE` | `/media/files/{id}/shares`        | Owner          | Remove the `?username=bob` library share |
-| `PATCH`  | `/media/files/{id}/favorite`      | Regular user   | Set a personal favorite state            |
+| `PATCH`  | `/media/files/{id}/favorite`      | Authenticated  | Set a personal favorite state            |
 | `DELETE` | `/media/files/{id}`               | Owner          | Move owned media to trash                |
 | `PATCH`  | `/media/files/{id}/restore`       | Owner          | Restore owned media                      |
 | `DELETE` | `/media/files/{id}/permanent`     | Owner          | Delete owned media and its thumbnail     |
-| `GET`    | `/albums`                         | Regular user   | List owned albums                        |
-| `POST`   | `/albums`                         | Regular user   | Create an album                          |
-| `GET`    | `/albums/{albumId}`               | Regular user   | Get an album and accessible media        |
+| `GET`    | `/albums`                         | Authenticated  | List owned albums                        |
+| `POST`   | `/albums`                         | Authenticated  | Create an album                          |
+| `GET`    | `/albums/{albumId}`               | Authenticated  | Get an album and accessible media        |
 | `PATCH`  | `/albums/{albumId}`               | Owner          | Update an album                          |
 | `DELETE` | `/albums/{albumId}`               | Owner          | Delete an album                          |
-| `GET`    | `/storage`                        | Regular user   | Get accessible media totals              |
+| `GET`    | `/storage`                        | Authenticated  | Get accessible media totals              |
 | `POST`   | `/media/upload`                   | Cookie         | Create a resumable upload                |
 | `GET`    | `/media/upload/{id}`              | Cookie         | List uploaded parts                      |
 | `PUT`    | `/media/upload/{id}/parts/{part}` | Cookie         | Upload or replace one part               |

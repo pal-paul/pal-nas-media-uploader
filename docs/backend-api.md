@@ -34,7 +34,9 @@ it does not implement file transfer again.
   upload session. A client cannot choose `ownerId`.
 - During an upgrade from the single-owner schema, startup migration assigns
   legacy media without an owner to the oldest administrator account. The
-  migration then makes media ownership mandatory.
+  migration then makes media ownership mandatory. Authenticated administrators
+  may use gallery and download endpoints to access media assigned this way;
+  upload and regular-user management workflows remain role-restricted.
 - An owner may use an active item to share their library with another regular
   user. The recipient can access all current and future active media from that
   owner. Sharing grants list, album membership, favorite, download, storage,
@@ -42,13 +44,16 @@ it does not implement file transfer again.
 - Albums belong to one user. A user may add owned media or media available
   through a library share. If a library share is removed, all media from that
   owner is no longer returned in the recipient's albums.
+- Public album links may contain only media owned by the link creator. Shared
+  media can remain in private albums but is never exposed through those links.
 - Favorite state belongs to `(user, media)`, so users do not overwrite each
   other's favorites.
 - Only the owner may trash, restore, permanently delete, share, or unshare an
   item. Trashed media is immediately hidden from recipients.
-- Permanent deletion removes the physical media file and generated thumbnail,
-  then cascades its album links and personal preferences. Library-share
-  relationships remain active for the owner's other current and future media.
+- Permanent deletion stages the physical media file and generated thumbnail,
+  deletes the database record, then removes the staged files. A database error
+  restores both files before the request fails. Library-share relationships
+  remain active for the owner's other current and future media.
 - Resource lookups are scoped by the authenticated user. An inaccessible ID is
   reported as not found rather than exposing another user's data.
 
@@ -275,8 +280,8 @@ for complete request and response schemas.
 
 | Method   | Path                                    | Access             | Purpose                                                          |
 | -------- | --------------------------------------- | ------------------ | ---------------------------------------------------------------- |
-| `GET`    | `/media`                                | Regular user       | List active owned and shared media.                              |
-| `GET`    | `/media?trash=true`                     | Regular user       | List only the current user's trash.                              |
+| `GET`    | `/media`                                | Authenticated      | List active owned and shared media.                              |
+| `GET`    | `/media?trash=true`                     | Authenticated      | List only the current user's trash.                              |
 | `GET`    | `/media/files/{id}/download`            | Owner or recipient | Download active media.                                           |
 | `GET`    | `/media/files/{id}/thumbnail`           | Owner or recipient | Download the generated thumbnail.                                |
 | `GET`    | `/media/files/{id}/processing-status`   | Owner              | Get processing job status.                                       |
@@ -286,8 +291,8 @@ for complete request and response schemas.
 | `DELETE` | `/media/files/{id}`                     | Owner              | Move media to trash.                                             |
 | `PATCH`  | `/media/files/{id}/restore`             | Owner              | Restore media from trash.                                        |
 | `DELETE` | `/media/files/{id}/permanent`           | Owner              | Delete the file and database record.                             |
-| `GET`    | `/storage`                              | Regular user       | Return totals for accessible active media.                       |
-| `POST`   | `/media/public-links`                   | Owner              | Create an expiring media or album link.                          |
+| `GET`    | `/storage`                              | Authenticated      | Return totals for accessible active media.                       |
+| `POST`   | `/media/public-links`                   | Owner              | Link owned media or an album containing only owned media.        |
 | `DELETE` | `/media/public-links/{id}`              | Owner              | Revoke a public link.                                            |
 | `GET`    | `/public/{token}`                       | Public             | Inspect active public-link content.                              |
 | `GET`    | `/public/{token}/download`              | Public             | Download linked media or an album ZIP.                           |

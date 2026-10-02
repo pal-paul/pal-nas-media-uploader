@@ -3,6 +3,7 @@ package gallery
 import (
 	"bytes"
 	"context"
+	"errors"
 	"net/http"
 	"net/http/httptest"
 	"os"
@@ -20,6 +21,7 @@ type testRepository struct {
 	mediaFilter  MediaFilter
 	deletedID    string
 	deletedOwner string
+	deleteErr    error
 }
 
 func (repository *testRepository) ListAlbums(context.Context, string, string) ([]Album, error) {
@@ -65,7 +67,7 @@ func (repository *testRepository) GetOwnedMediaPaths(context.Context, string, st
 func (repository *testRepository) DeleteMedia(_ context.Context, mediaID, ownerID string) error {
 	repository.deletedID = mediaID
 	repository.deletedOwner = ownerID
-	return nil
+	return repository.deleteErr
 }
 func (repository *testRepository) GetStorage(context.Context, string) (Storage, error) {
 	return Storage{}, nil
@@ -127,6 +129,41 @@ func TestDeleteMediaRemovesOwnedFile(t *testing.T) {
 	}
 	if repository.deletedID != "media-1" || repository.deletedOwner != "user-1" {
 		t.Fatalf("unexpected delete scope: media=%q owner=%q", repository.deletedID, repository.deletedOwner)
+	}
+}
+
+func TestDeleteMediaRestoresFilesWhenDatabaseDeleteFails(t *testing.T) {
+	mediaDir := t.TempDir()
+	relativePath := filepath.Join("alice", "video.mp4")
+	thumbnailRelativePath := filepath.Join(".thumbnails", "user-1", "media-1.jpg")
+	for path, content := range map[string]string{
+		relativePath: "media", thumbnailRelativePath: "thumbnail",
+	} {
+		absolutePath := filepath.Join(mediaDir, path)
+		if err := os.MkdirAll(filepath.Dir(absolutePath), 0o750); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.WriteFile(absolutePath, []byte(content), 0o600); err != nil {
+			t.Fatal(err)
+		}
+	}
+	repository := &testRepository{
+		mediaPaths: MediaPaths{Media: relativePath, Thumbnail: thumbnailRelativePath},
+		deleteErr:  errors.New("database unavailable"),
+	}
+	router := testRouter(repository, mediaDir)
+	request := httptest.NewRequest(http.MethodDelete, "/media/files/media-1/permanent", nil)
+	response := httptest.NewRecorder()
+
+	router.ServeHTTP(response, request)
+
+	if response.Code != http.StatusInternalServerError {
+		t.Fatalf("expected status %d, got %d: %s", http.StatusInternalServerError, response.Code, response.Body.String())
+	}
+	for _, path := range []string{relativePath, thumbnailRelativePath} {
+		if _, err := os.Stat(filepath.Join(mediaDir, path)); err != nil {
+			t.Fatalf("expected %s to be restored: %v", path, err)
+		}
 	}
 }
 

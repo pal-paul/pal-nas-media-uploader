@@ -43,7 +43,8 @@ endpoints require the existing session cookie. User endpoints require the
 
 - `POST /media/public-links` creates an expiring media or album link with an
   optional password. Send `mediaId` or `albumId`, `expiresAt`, and optional
-  `password`.
+  `password`. Public album links are accepted only when every album item is
+  owned by the link creator; privately shared media is never re-shared.
 - Public consumers use `GET /public/{token}` and `GET
 /public/{token}/download`. Passwords are supplied in `X-Share-Password`;
   three failed attempts lock that link/client pair for five minutes.

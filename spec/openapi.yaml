@@ -42,8 +42,9 @@ info:
     media for listing, download, album membership, favorites, storage totals, and
     automatic albums. Sharing never transfers ownership. Favorites are per-user.
     Trashing is owner-only and immediately hides media from recipients; permanent
-    deletion removes the physical file, generated thumbnail, and associated
-    database rows.
+    deletion stages the physical file and generated thumbnail, removes associated
+    database rows, and then removes the staged files. Public album links never
+    expose media owned by another user.
 
     ## Albums
 
@@ -781,12 +782,12 @@ paths:
       operationId: permanentlyDeleteMedia
       summary: Permanently delete an owned media file and all associations
       description: |
-        Deletes the physical media file and generated thumbnail, then removes
-        the owned media record. Database cascades remove album membership and
-        personal preferences for that item. The owner's library-share
-        relationships remain active for their other current and future media.
-        Missing files are tolerated. Filesystem deletion failures return `502`
-        and prevent successful completion.
+        Stages the physical media file and generated thumbnail, then removes the
+        owned media record. A database failure restores the staged files.
+        Database cascades remove album membership and personal preferences for
+        that item. The owner's library-share relationships remain active for
+        their other current and future media. Missing files are tolerated.
+        Filesystem staging failures return `502` and prevent deletion.
       parameters:
         - $ref: "#/components/parameters/UploadID"
       responses:
@@ -1301,6 +1302,7 @@ paths:
       tags: [Public Sharing]
       operationId: createPublicLink
       summary: Create an expiring public media or album link
+      description: Album links are accepted only when every album item is owned by the link creator. Media received through a library share is never exposed publicly by its recipient.
       requestBody:
         required: true
         content:

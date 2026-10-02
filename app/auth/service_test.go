@@ -168,8 +168,8 @@ func TestEnrollmentRejectsLostRace(t *testing.T) {
 	if _, err := service.Verify(ctx, challenge.ChallengeToken, code); !errors.Is(err, ErrInvalidChallenge) {
 		t.Fatalf("lost enrollment race returned %v", err)
 	}
-	if repository.challengeAvailable || repository.session != "" {
-		t.Fatalf("losing challenge remained active or created a session")
+	if !repository.challengeAvailable || repository.session != "" {
+		t.Fatalf("losing verifier consumed the challenge or created a session")
 	}
 }
 

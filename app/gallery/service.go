@@ -203,6 +203,7 @@ func (service *Service) DeleteMedia(context *gin.Context) {
 		respondNoContent(context, err)
 		return
 	}
+	absolutePaths := make([]string, 0, 2)
 	for _, relativePath := range []string{paths.Media, paths.Thumbnail} {
 		if relativePath == "" {
 			continue
@@ -212,12 +213,55 @@ func (service *Service) DeleteMedia(context *gin.Context) {
 			respondNoContent(context, err)
 			return
 		}
-		if err := os.Remove(path); err != nil && !errors.Is(err, os.ErrNotExist) {
+		absolutePaths = append(absolutePaths, path)
+	}
+	stagingDir := filepath.Join(service.mediaDir, ".deleting", uuid.NewString())
+	staged := make([]stagedMediaFile, 0, len(absolutePaths))
+	for index, originalPath := range absolutePaths {
+		if err := os.MkdirAll(stagingDir, 0o750); err != nil {
 			context.JSON(http.StatusBadGateway, gin.H{"error": "unable to delete media file"})
 			return
 		}
+		stagedPath := filepath.Join(stagingDir, strconv.Itoa(index)+"-"+filepath.Base(originalPath))
+		if err := os.Rename(originalPath, stagedPath); errors.Is(err, os.ErrNotExist) {
+			continue
+		} else if err != nil {
+			_ = restoreStagedMedia(staged)
+			_ = os.RemoveAll(stagingDir)
+			context.JSON(http.StatusBadGateway, gin.H{"error": "unable to delete media file"})
+			return
+		}
+		staged = append(staged, stagedMediaFile{original: originalPath, staged: stagedPath})
 	}
-	respondNoContent(context, service.repository.DeleteMedia(context, mediaID, user.ID))
+	if err := service.repository.DeleteMedia(context, mediaID, user.ID); err != nil {
+		if restoreErr := restoreStagedMedia(staged); restoreErr != nil {
+			_ = context.Error(restoreErr)
+			context.JSON(http.StatusBadGateway, gin.H{"error": "unable to restore media file after failed deletion"})
+			return
+		}
+		_ = os.RemoveAll(stagingDir)
+		respondNoContent(context, err)
+		return
+	}
+	if err := os.RemoveAll(stagingDir); err != nil {
+		_ = context.Error(err)
+	}
+	context.Status(http.StatusNoContent)
+}
+
+type stagedMediaFile struct {
+	original string
+	staged   string
+}
+
+func restoreStagedMedia(files []stagedMediaFile) error {
+	var restoreErr error
+	for index := len(files) - 1; index >= 0; index-- {
+		if err := os.Rename(files[index].staged, files[index].original); err != nil {
+			restoreErr = errors.Join(restoreErr, err)
+		}
+	}
+	return restoreErr
 }
 
 func (service *Service) mediaPath(relativePath string) (string, error) {
