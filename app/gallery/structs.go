@@ -60,6 +60,11 @@ type Storage struct {
 	VideoCount int64 `json:"videoCount"`
 }
 
+type MediaPaths struct {
+	Media     string
+	Thumbnail string
+}
+
 type Repository interface {
 	ListAlbums(context.Context, string, string) ([]Album, error)
 	CreateAlbum(context.Context, Album) error
@@ -74,7 +79,7 @@ type Repository interface {
 	SetFavorite(context.Context, string, string, bool) error
 	TrashMedia(context.Context, string, string) error
 	RestoreMedia(context.Context, string, string) error
-	GetOwnedMediaPath(context.Context, string, string) (string, error)
+	GetOwnedMediaPaths(context.Context, string, string) (MediaPaths, error)
 	DeleteMedia(context.Context, string, string) error
 	GetStorage(context.Context, string) (Storage, error)
 }

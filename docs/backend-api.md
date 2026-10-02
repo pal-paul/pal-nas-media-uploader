@@ -32,6 +32,9 @@ it does not implement file transfer again.
 
 - Every completed media item has one owner, assigned from the authenticated
   upload session. A client cannot choose `ownerId`.
+- During an upgrade from the single-owner schema, startup migration assigns
+  legacy media without an owner to the oldest administrator account. The
+  migration then makes media ownership mandatory.
 - An owner may use an active item to share their library with another regular
   user. The recipient can access all current and future active media from that
   owner. Sharing grants list, album membership, favorite, download, storage,
@@ -43,9 +46,9 @@ it does not implement file transfer again.
   other's favorites.
 - Only the owner may trash, restore, permanently delete, share, or unshare an
   item. Trashed media is immediately hidden from recipients.
-- Permanent deletion removes the physical file and cascades its album links and
-  personal preferences. Library-share relationships remain active for the
-  owner's other current and future media.
+- Permanent deletion removes the physical media file and generated thumbnail,
+  then cascades its album links and personal preferences. Library-share
+  relationships remain active for the owner's other current and future media.
 - Resource lookups are scoped by the authenticated user. An inaccessible ID is
   reported as not found rather than exposing another user's data.
 
@@ -351,10 +354,12 @@ Add media:
 Thumbnail and metadata extraction are intentionally asynchronous. Completing
 an upload creates a PostgreSQL-backed processing job; the in-process worker
 uses FFmpeg and FFprobe and persists its progress across container restarts.
+Failed work is requeued with a bounded backoff, and jobs left in `processing`
+for 15 minutes are eligible to be reclaimed after a worker interruption.
 The gallery remains responsible for access and presentation, while processing
 owns generated thumbnails, dimensions, duration, capture time, EXIF, and GPS.
-Filesystem integrity scanning remains an administrator operation and never
-imports unowned files automatically.
+Filesystem integrity scanning ignores the managed `.thumbnails` tree, remains
+an administrator operation, and never imports unowned files automatically.
 
 ## Errors
 

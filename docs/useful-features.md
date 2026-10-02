@@ -9,14 +9,18 @@ endpoints require the existing session cookie. User endpoints require the
 - `POST /media/upload/check` checks an owner-scoped SHA-256 digest before
   uploading.
 - `POST /media/upload-batches` creates a durable batch. Include its returned
-  `id` as `batchId` in the existing `POST /media/upload` request.
+  `id` as `batchId` in the existing `POST /media/upload` request. The embedded
+  workspace performs duplicate checks first, so batch file and byte totals
+  include only files that will be uploaded.
 - `GET /media/upload-batches/{id}` reports completed files and bytes. `POST
 /media/upload-batches/{id}/cancel` prevents new or late completions.
 - Completed uploads enqueue a PostgreSQL-backed FFmpeg job. `GET
-/media/files/{id}/processing-status` reports progress.
+/media/files/{id}/processing-status` reports progress. Failed jobs are retried,
+  and interrupted jobs are reclaimed after 15 minutes in `processing`.
 - Generated thumbnails are available at `GET /media/files/{id}/thumbnail`.
   Gallery records include dimensions, duration, capture time, and GPS
-  coordinates when found.
+  coordinates when found. Permanent deletion removes both the original media
+  and its generated thumbnail.
 - Gallery filters accept `capturedAfter`, `capturedBefore` (RFC3339),
   `latitude`, `longitude`, and `radiusKm`.
 

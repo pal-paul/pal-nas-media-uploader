@@ -226,10 +226,11 @@ func (store *Postgres) RestoreMedia(ctx context.Context, mediaID, userID string)
 	return changed(result.RowsAffected(), err)
 }
 
-func (store *Postgres) GetOwnedMediaPath(ctx context.Context, mediaID, userID string) (string, error) {
-	var path string
-	err := store.pool.QueryRow(ctx, `SELECT media_path FROM media_uploads WHERE upload_id = $1 AND owner_id = $2`, mediaID, userID).Scan(&path)
-	return path, galleryError(err)
+func (store *Postgres) GetOwnedMediaPaths(ctx context.Context, mediaID, userID string) (gallery.MediaPaths, error) {
+	var paths gallery.MediaPaths
+	err := store.pool.QueryRow(ctx, `SELECT media_path, COALESCE(thumbnail_path, '') FROM media_uploads
+		WHERE upload_id = $1 AND owner_id = $2`, mediaID, userID).Scan(&paths.Media, &paths.Thumbnail)
+	return paths, galleryError(err)
 }
 
 func (store *Postgres) DeleteMedia(ctx context.Context, mediaID, userID string) error {

@@ -142,16 +142,21 @@ func (service *Service) SetAlbumCover(context *gin.Context) {
 
 func (service *Service) ListMedia(context *gin.Context) {
 	filter := MediaFilter{Search: context.Query("search"), Kind: context.Query("kind"), Sort: context.Query("sort"), Trash: context.Query("trash") == "true"}
-	for value, target := range map[string]**time.Time{
-		context.Query("capturedAfter"): &filter.CapturedAfter, context.Query("capturedBefore"): &filter.CapturedBefore,
+	for _, bound := range []struct {
+		value  string
+		target **time.Time
+	}{
+		{value: context.Query("capturedAfter"), target: &filter.CapturedAfter},
+		{value: context.Query("capturedBefore"), target: &filter.CapturedBefore},
 	} {
+		value := bound.value
 		if value != "" {
 			parsed, err := time.Parse(time.RFC3339, value)
 			if err != nil {
 				context.JSON(http.StatusBadRequest, gin.H{"error": "capture dates must use RFC3339"})
 				return
 			}
-			*target = &parsed
+			*bound.target = &parsed
 		}
 	}
 	for name, target := range map[string]**float64{"latitude": &filter.Latitude, "longitude": &filter.Longitude, "radiusKm": &filter.RadiusKM} {
@@ -193,22 +198,35 @@ func (service *Service) RestoreMedia(context *gin.Context) {
 func (service *Service) DeleteMedia(context *gin.Context) {
 	user := currentUser(context)
 	mediaID := context.Param("id")
-	relativePath, err := service.repository.GetOwnedMediaPath(context, mediaID, user.ID)
+	paths, err := service.repository.GetOwnedMediaPaths(context, mediaID, user.ID)
 	if err != nil {
 		respondNoContent(context, err)
 		return
 	}
-	path := filepath.Join(service.mediaDir, filepath.FromSlash(relativePath))
-	cleanRelative, pathErr := filepath.Rel(service.mediaDir, path)
-	if pathErr != nil || cleanRelative == ".." || strings.HasPrefix(cleanRelative, ".."+string(filepath.Separator)) {
-		respondNoContent(context, ErrForbidden)
-		return
-	}
-	if err := os.Remove(path); err != nil && !errors.Is(err, os.ErrNotExist) {
-		context.JSON(http.StatusBadGateway, gin.H{"error": "unable to delete media file"})
-		return
+	for _, relativePath := range []string{paths.Media, paths.Thumbnail} {
+		if relativePath == "" {
+			continue
+		}
+		path, err := service.mediaPath(relativePath)
+		if err != nil {
+			respondNoContent(context, err)
+			return
+		}
+		if err := os.Remove(path); err != nil && !errors.Is(err, os.ErrNotExist) {
+			context.JSON(http.StatusBadGateway, gin.H{"error": "unable to delete media file"})
+			return
+		}
 	}
 	respondNoContent(context, service.repository.DeleteMedia(context, mediaID, user.ID))
+}
+
+func (service *Service) mediaPath(relativePath string) (string, error) {
+	path := filepath.Join(service.mediaDir, filepath.FromSlash(relativePath))
+	cleanRelative, err := filepath.Rel(service.mediaDir, path)
+	if err != nil || cleanRelative == ".." || strings.HasPrefix(cleanRelative, ".."+string(filepath.Separator)) || filepath.IsAbs(cleanRelative) {
+		return "", ErrForbidden
+	}
+	return path, nil
 }
 
 func (service *Service) GetStorage(context *gin.Context) {

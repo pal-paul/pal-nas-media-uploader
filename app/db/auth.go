@@ -71,9 +71,9 @@ func (store *Postgres) DeleteAuthChallenge(ctx context.Context, tokenHash string
 	return err == nil && result.RowsAffected() == 1, err
 }
 
-func (store *Postgres) EnableTOTP(ctx context.Context, userID, secret string) error {
-	_, err := store.pool.Exec(ctx, `UPDATE users SET totp_secret = $2 WHERE id = $1 AND totp_secret IS NULL`, userID, secret)
-	return err
+func (store *Postgres) EnableTOTP(ctx context.Context, userID, secret string) (bool, error) {
+	result, err := store.pool.Exec(ctx, `UPDATE users SET totp_secret = $2 WHERE id = $1 AND totp_secret IS NULL`, userID, secret)
+	return err == nil && result.RowsAffected() == 1, err
 }
 
 func (store *Postgres) CreateAuthSession(ctx context.Context, tokenHash, userID string, expiresAt time.Time) error {

@@ -16,6 +16,7 @@ type memoryRepository struct {
 	challengeAvailable bool
 	session            string
 	recoveryCodes      map[string]bool
+	enableTOTPSucceeds *bool
 }
 
 func (repository *memoryRepository) GetAuthUserByUsername(_ context.Context, username string) (User, error) {
@@ -42,9 +43,12 @@ func (repository *memoryRepository) DeleteAuthChallenge(context.Context, string)
 	repository.challengeAvailable = false
 	return true, nil
 }
-func (repository *memoryRepository) EnableTOTP(_ context.Context, _ string, secret string) error {
+func (repository *memoryRepository) EnableTOTP(_ context.Context, _ string, secret string) (bool, error) {
+	if repository.enableTOTPSucceeds != nil && !*repository.enableTOTPSucceeds {
+		return false, nil
+	}
 	repository.user.TOTPSecret = secret
-	return nil
+	return true, nil
 }
 func (repository *memoryRepository) CreateAuthSession(_ context.Context, tokenHash, _ string, _ time.Time) error {
 	repository.session = tokenHash
@@ -144,6 +148,28 @@ func TestChallengeCannotBeReused(t *testing.T) {
 	}
 	if _, err := service.Verify(ctx, challenge.ChallengeToken, code); !errors.Is(err, ErrInvalidChallenge) {
 		t.Fatalf("got %v, want invalid challenge", err)
+	}
+}
+
+func TestEnrollmentRejectsLostRace(t *testing.T) {
+	ctx := context.Background()
+	enableTOTPSucceeds := false
+	repository := &memoryRepository{user: passwordUser(t, true), enableTOTPSucceeds: &enableTOTPSucceeds}
+	service := NewService(repository, "PAL Gallery Test")
+	challenge, err := service.BeginLogin(ctx, "admin", "correct-horse-battery")
+	if err != nil {
+		t.Fatal(err)
+	}
+	code, err := totp.GenerateCode(challenge.Secret, time.Now())
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	if _, err := service.Verify(ctx, challenge.ChallengeToken, code); !errors.Is(err, ErrInvalidChallenge) {
+		t.Fatalf("lost enrollment race returned %v", err)
+	}
+	if repository.challengeAvailable || repository.session != "" {
+		t.Fatalf("losing challenge remained active or created a session")
 	}
 }
 

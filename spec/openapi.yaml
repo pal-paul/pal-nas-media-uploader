@@ -42,7 +42,8 @@ info:
     media for listing, download, album membership, favorites, storage totals, and
     automatic albums. Sharing never transfers ownership. Favorites are per-user.
     Trashing is owner-only and immediately hides media from recipients; permanent
-    deletion removes the physical file and associated database rows.
+    deletion removes the physical file, generated thumbnail, and associated
+    database rows.
 
     ## Albums
 
@@ -780,12 +781,12 @@ paths:
       operationId: permanentlyDeleteMedia
       summary: Permanently delete an owned media file and all associations
       description: |
-        Deletes the physical file and then removes the owned media record.
-        Database cascades remove album membership and personal preferences for
-        that item. The owner's library-share relationships remain active for
-        their other current and future media. A missing file is tolerated.
-        Filesystem deletion failures return `502` and prevent successful
-        completion.
+        Deletes the physical media file and generated thumbnail, then removes
+        the owned media record. Database cascades remove album membership and
+        personal preferences for that item. The owner's library-share
+        relationships remain active for their other current and future media.
+        Missing files are tolerated. Filesystem deletion failures return `502`
+        and prevent successful completion.
       parameters:
         - $ref: "#/components/parameters/UploadID"
       responses:

@@ -48,14 +48,14 @@ func (store *Postgres) ExportManifest(ctx context.Context, ownerID string) (tran
 }
 
 func (store *Postgres) ImportManifest(ctx context.Context, ownerID, sessionID string, manifest transfer.Manifest) (int, error) {
-	if _, err := store.pool.Exec(ctx, `INSERT INTO import_sessions (id, owner_id, status) VALUES ($1, $2, 'processing')`, sessionID, ownerID); err != nil {
-		return 0, err
-	}
 	transaction, err := store.pool.Begin(ctx)
 	if err != nil {
 		return 0, err
 	}
 	defer func() { _ = transaction.Rollback(ctx) }()
+	if _, err := transaction.Exec(ctx, `INSERT INTO import_sessions (id, owner_id, status) VALUES ($1, $2, 'processing')`, sessionID, ownerID); err != nil {
+		return 0, err
+	}
 	for _, album := range manifest.Albums {
 		if album.Title == "" {
 			return 0, errors.New("album title is required")

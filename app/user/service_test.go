@@ -133,3 +133,19 @@ func TestUnshareAcceptsUsernameQueryAndLegacyBody(t *testing.T) {
 		})
 	}
 }
+
+func TestMediaTemplatePreflightsUploadsAndUsesGalleryRoute(t *testing.T) {
+	content, err := configurationTemplates.ReadFile("templates/media.html")
+	if err != nil {
+		t.Fatal(err)
+	}
+	page := string(content)
+	preflight := strings.Index(page, "const uploads=[],seen=new Set()")
+	createBatch := strings.Index(page, "api('/media/upload-batches'")
+	if preflight < 0 || createBatch < 0 || preflight > createBatch {
+		t.Fatal("expected duplicate preflight before batch creation")
+	}
+	if !strings.Contains(page, "api(`/media?${query}`)") || strings.Contains(page, "api(`/media/files?${query}`)") {
+		t.Fatal("media workspace does not use the gallery route")
+	}
+}

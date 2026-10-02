@@ -63,7 +63,13 @@ func TestScanIntegrityReportsBothDirections(t *testing.T) {
 	if err := os.MkdirAll(filepath.Join(root, "alice"), 0750); err != nil {
 		t.Fatal(err)
 	}
+	if err := os.MkdirAll(filepath.Join(root, ".thumbnails", "user-1"), 0750); err != nil {
+		t.Fatal(err)
+	}
 	if err := os.WriteFile(filepath.Join(root, "alice", "extra.jpg"), []byte("image"), 0640); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(root, ".thumbnails", "user-1", "media-1.jpg"), []byte("image"), 0640); err != nil {
 		t.Fatal(err)
 	}
 	service, err := New(&testRepository{mediaPaths: []string{"alice/missing.jpg"}}, &testUploads{}, root, t.TempDir(), 0)

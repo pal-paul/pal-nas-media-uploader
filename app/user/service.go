@@ -17,7 +17,7 @@ import (
 var ErrForbidden = errors.New("forbidden")
 var ErrInvalidFolder = errors.New("upload folder must be a relative path without parent traversal")
 
-//go:embed templates/config.html
+//go:embed templates/*.html
 var configurationTemplates embed.FS
 
 var configurationTemplate = template.Must(template.ParseFS(configurationTemplates, "templates/*.html"))

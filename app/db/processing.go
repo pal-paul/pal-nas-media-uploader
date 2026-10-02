@@ -21,7 +21,9 @@ func (store *Postgres) ClaimProcessingJob(ctx context.Context) (processing.Job, 
 	err = transaction.QueryRow(ctx, `SELECT job.id, job.upload_id, media.owner_id, media.media_path,
 		job.status, job.attempts, COALESCE(job.last_error, ''), job.scheduled_for, job.updated_at
 		FROM media_processing_jobs job JOIN media_uploads media ON media.upload_id = job.upload_id
-		WHERE job.status = 'queued' AND job.scheduled_for <= now() AND media.deleted_at IS NULL
+		WHERE ((job.status = 'queued' AND job.scheduled_for <= now()) OR
+			(job.status = 'processing' AND job.updated_at <= now() - interval '15 minutes'))
+			AND media.deleted_at IS NULL
 		ORDER BY job.scheduled_for, job.created_at FOR UPDATE OF job SKIP LOCKED LIMIT 1`).Scan(
 		&job.ID, &job.UploadID, &job.OwnerID, &job.MediaPath, &job.Status, &job.Attempts,
 		&job.LastError, &job.Scheduled, &job.UpdatedAt)

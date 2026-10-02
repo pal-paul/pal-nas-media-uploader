@@ -37,7 +37,7 @@ type Database interface {
 	CreateAuthChallenge(context.Context, string, string, string, time.Time) error
 	GetAuthChallenge(context.Context, string) (Challenge, error)
 	DeleteAuthChallenge(context.Context, string) (bool, error)
-	EnableTOTP(context.Context, string, string) error
+	EnableTOTP(context.Context, string, string) (bool, error)
 	CreateAuthSession(context.Context, string, string, time.Time) error
 	GetAuthSessionUser(context.Context, string, time.Time) (User, error)
 	DeleteAuthSession(context.Context, string) error
@@ -221,8 +221,15 @@ func (service *Service) Verify(ctx context.Context, challengeToken, code string)
 		return "", ErrInvalidCode
 	}
 	if challenge.TOTPSecret == "" {
-		if err := service.database.EnableTOTP(ctx, challenge.UserID, secret); err != nil {
+		enabled, err := service.database.EnableTOTP(ctx, challenge.UserID, secret)
+		if err != nil {
 			return "", err
+		}
+		if !enabled {
+			if _, err := service.database.DeleteAuthChallenge(ctx, hash); err != nil {
+				return "", err
+			}
+			return "", ErrInvalidChallenge
 		}
 	}
 	deleted, err := service.database.DeleteAuthChallenge(ctx, hash)

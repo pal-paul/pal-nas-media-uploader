@@ -266,7 +266,7 @@ curl -fsS -b "$COOKIE_JAR" -OJ "$BASE_URL/media/files/$UPLOAD_ID/download"
 | `PATCH`  | `/media/files/{id}/favorite`      | Regular user   | Set a personal favorite state            |
 | `DELETE` | `/media/files/{id}`               | Owner          | Move owned media to trash                |
 | `PATCH`  | `/media/files/{id}/restore`       | Owner          | Restore owned media                      |
-| `DELETE` | `/media/files/{id}/permanent`     | Owner          | Permanently delete owned media           |
+| `DELETE` | `/media/files/{id}/permanent`     | Owner          | Delete owned media and its thumbnail     |
 | `GET`    | `/albums`                         | Regular user   | List owned albums                        |
 | `POST`   | `/albums`                         | Regular user   | Create an album                          |
 | `GET`    | `/albums/{albumId}`               | Regular user   | Get an album and accessible media        |

@@ -84,12 +84,24 @@ func (service *Service) ProcessOnce(ctx context.Context) (bool, error) {
 	}
 	metadata, err := service.process(ctx, job)
 	if err != nil {
-		if failErr := service.repository.FailProcessingJob(ctx, job, err.Error()); failErr != nil {
+		if failErr := service.recordFailure(job, err); failErr != nil {
 			return true, fmt.Errorf("process media: %v; record failure: %w", err, failErr)
 		}
 		return true, err
 	}
-	return true, service.repository.CompleteProcessingJob(ctx, job, metadata)
+	if err := service.repository.CompleteProcessingJob(ctx, job, metadata); err != nil {
+		if failErr := service.recordFailure(job, fmt.Errorf("complete processing job: %w", err)); failErr != nil {
+			return true, fmt.Errorf("complete processing job: %v; record failure: %w", err, failErr)
+		}
+		return true, err
+	}
+	return true, nil
+}
+
+func (service *Service) recordFailure(job Job, processingErr error) error {
+	failureContext, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	return service.repository.FailProcessingJob(failureContext, job, processingErr.Error())
 }
 
 func (service *Service) processMedia(ctx context.Context, job Job) (Metadata, error) {

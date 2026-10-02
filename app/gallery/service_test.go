@@ -16,7 +16,8 @@ import (
 
 type testRepository struct {
 	createdAlbum Album
-	mediaPath    string
+	mediaPaths   MediaPaths
+	mediaFilter  MediaFilter
 	deletedID    string
 	deletedOwner string
 }
@@ -47,7 +48,8 @@ func (repository *testRepository) RemoveAlbumMedia(context.Context, string, stri
 func (repository *testRepository) SetAlbumCover(context.Context, string, string, string) error {
 	return nil
 }
-func (repository *testRepository) ListMedia(context.Context, string, MediaFilter) ([]Media, error) {
+func (repository *testRepository) ListMedia(_ context.Context, _ string, filter MediaFilter) ([]Media, error) {
+	repository.mediaFilter = filter
 	return nil, nil
 }
 func (repository *testRepository) SetFavorite(context.Context, string, string, bool) error {
@@ -57,8 +59,8 @@ func (repository *testRepository) TrashMedia(context.Context, string, string) er
 func (repository *testRepository) RestoreMedia(context.Context, string, string) error {
 	return nil
 }
-func (repository *testRepository) GetOwnedMediaPath(context.Context, string, string) (string, error) {
-	return repository.mediaPath, nil
+func (repository *testRepository) GetOwnedMediaPaths(context.Context, string, string) (MediaPaths, error) {
+	return repository.mediaPaths, nil
 }
 func (repository *testRepository) DeleteMedia(_ context.Context, mediaID, ownerID string) error {
 	repository.deletedID = mediaID
@@ -93,13 +95,21 @@ func TestDeleteMediaRemovesOwnedFile(t *testing.T) {
 	mediaDir := t.TempDir()
 	relativePath := filepath.Join("alice", "video.mp4")
 	path := filepath.Join(mediaDir, relativePath)
+	thumbnailRelativePath := filepath.Join(".thumbnails", "user-1", "media-1.jpg")
+	thumbnailPath := filepath.Join(mediaDir, thumbnailRelativePath)
 	if err := os.MkdirAll(filepath.Dir(path), 0750); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.MkdirAll(filepath.Dir(thumbnailPath), 0750); err != nil {
 		t.Fatal(err)
 	}
 	if err := os.WriteFile(path, []byte("media"), 0600); err != nil {
 		t.Fatal(err)
 	}
-	repository := &testRepository{mediaPath: relativePath}
+	if err := os.WriteFile(thumbnailPath, []byte("thumbnail"), 0600); err != nil {
+		t.Fatal(err)
+	}
+	repository := &testRepository{mediaPaths: MediaPaths{Media: relativePath, Thumbnail: thumbnailRelativePath}}
 	router := testRouter(repository, mediaDir)
 	request := httptest.NewRequest(http.MethodDelete, "/media/files/media-1/permanent", nil)
 	response := httptest.NewRecorder()
@@ -112,8 +122,27 @@ func TestDeleteMediaRemovesOwnedFile(t *testing.T) {
 	if _, err := os.Stat(path); !os.IsNotExist(err) {
 		t.Fatalf("expected media file to be removed, got %v", err)
 	}
+	if _, err := os.Stat(thumbnailPath); !os.IsNotExist(err) {
+		t.Fatalf("expected thumbnail file to be removed, got %v", err)
+	}
 	if repository.deletedID != "media-1" || repository.deletedOwner != "user-1" {
 		t.Fatalf("unexpected delete scope: media=%q owner=%q", repository.deletedID, repository.deletedOwner)
+	}
+}
+
+func TestListMediaPreservesEqualCaptureBounds(t *testing.T) {
+	repository := &testRepository{}
+	router := testRouter(repository, t.TempDir())
+	request := httptest.NewRequest(http.MethodGet, "/media?capturedAfter=2026-10-01T00:00:00Z&capturedBefore=2026-10-01T00:00:00Z", nil)
+	response := httptest.NewRecorder()
+
+	router.ServeHTTP(response, request)
+
+	if response.Code != http.StatusOK {
+		t.Fatalf("expected status %d, got %d: %s", http.StatusOK, response.Code, response.Body.String())
+	}
+	if repository.mediaFilter.CapturedAfter == nil || repository.mediaFilter.CapturedBefore == nil {
+		t.Fatalf("expected both capture bounds, got %#v", repository.mediaFilter)
 	}
 }
 

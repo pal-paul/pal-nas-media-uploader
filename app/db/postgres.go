@@ -97,6 +97,10 @@ ALTER TABLE media_uploads ADD COLUMN IF NOT EXISTS width INTEGER;
 ALTER TABLE media_uploads ADD COLUMN IF NOT EXISTS height INTEGER;
 ALTER TABLE media_uploads ADD COLUMN IF NOT EXISTS video_duration_seconds DOUBLE PRECISION;
 ALTER TABLE media_uploads ADD COLUMN IF NOT EXISTS batch_id UUID REFERENCES upload_batches(id) ON DELETE SET NULL;
+UPDATE media_uploads SET owner_id = (
+	SELECT id FROM users WHERE role = 'admin' ORDER BY created_at, id LIMIT 1
+) WHERE owner_id IS NULL;
+ALTER TABLE media_uploads ALTER COLUMN owner_id SET NOT NULL;
 CREATE INDEX IF NOT EXISTS media_uploads_owner_id_idx ON media_uploads(owner_id);
 CREATE INDEX IF NOT EXISTS media_uploads_deleted_at_idx ON media_uploads(deleted_at) WHERE deleted_at IS NOT NULL;
 CREATE TABLE IF NOT EXISTS media_processing_jobs (

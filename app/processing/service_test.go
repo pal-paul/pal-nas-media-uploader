@@ -7,10 +7,12 @@ import (
 )
 
 type jobRepository struct {
-	job       Job
-	available bool
-	completed bool
-	failed    bool
+	job                 Job
+	available           bool
+	completed           bool
+	failed              bool
+	completeErr         error
+	failureContextError error
 }
 
 func (repository *jobRepository) ClaimProcessingJob(context.Context) (Job, bool, error) {
@@ -22,10 +24,11 @@ func (repository *jobRepository) ClaimProcessingJob(context.Context) (Job, bool,
 }
 func (repository *jobRepository) CompleteProcessingJob(context.Context, Job, Metadata) error {
 	repository.completed = true
-	return nil
+	return repository.completeErr
 }
-func (repository *jobRepository) FailProcessingJob(context.Context, Job, string) error {
+func (repository *jobRepository) FailProcessingJob(ctx context.Context, _ Job, _ string) error {
 	repository.failed = true
+	repository.failureContextError = ctx.Err()
 	return nil
 }
 func (*jobRepository) GetProcessingStatus(context.Context, string, string) (Job, error) {
@@ -57,5 +60,40 @@ func TestProcessOnceCompletesOrRetriesJob(t *testing.T) {
 				t.Fatalf("retry state: err=%v complete=%t failed=%t", err, repository.completed, repository.failed)
 			}
 		})
+	}
+}
+
+func TestProcessOnceRecordsFailureWithIndependentContext(t *testing.T) {
+	repository := &jobRepository{job: Job{ID: "job"}, available: true}
+	service := New(repository, t.TempDir())
+	service.process = func(context.Context, Job) (Metadata, error) {
+		return Metadata{}, context.Canceled
+	}
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+
+	processed, err := service.ProcessOnce(ctx)
+
+	if !processed || !errors.Is(err, context.Canceled) {
+		t.Fatalf("expected canceled claimed job, processed=%t err=%v", processed, err)
+	}
+	if !repository.failed || repository.failureContextError != nil {
+		t.Fatalf("failure state: failed=%t contextErr=%v", repository.failed, repository.failureContextError)
+	}
+}
+
+func TestProcessOnceRequeuesCompletionFailure(t *testing.T) {
+	completionErr := errors.New("database unavailable")
+	repository := &jobRepository{job: Job{ID: "job"}, available: true, completeErr: completionErr}
+	service := New(repository, t.TempDir())
+	service.process = func(context.Context, Job) (Metadata, error) { return Metadata{}, nil }
+
+	processed, err := service.ProcessOnce(context.Background())
+
+	if !processed || !errors.Is(err, completionErr) {
+		t.Fatalf("expected completion failure, processed=%t err=%v", processed, err)
+	}
+	if !repository.completed || !repository.failed {
+		t.Fatalf("completion state: completed=%t failed=%t", repository.completed, repository.failed)
 	}
 }

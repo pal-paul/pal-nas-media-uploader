@@ -121,6 +121,9 @@ func (service *Service) ScanIntegrity(ctx context.Context) (IntegrityReport, err
 		if walkErr != nil {
 			return walkErr
 		}
+		if entry.IsDir() && entry.Name() == ".thumbnails" {
+			return filepath.SkipDir
+		}
 		if entry.IsDir() || strings.HasPrefix(entry.Name(), ".complete-") {
 			return nil
 		}
