@@ -53,9 +53,18 @@ func (service *Service) Run(ctx context.Context) (int, error) {
 		return 0, err
 	}
 	byFolder := make(map[string]User, len(users))
+	ambiguousFolders := make(map[string]struct{})
 	for _, user := range users {
 		folder := filepath.Clean(user.UploadFolder)
 		if user.ID != "" && folder != "." && !filepath.IsAbs(folder) && !strings.HasPrefix(folder, ".."+string(filepath.Separator)) {
+			if _, ambiguous := ambiguousFolders[folder]; ambiguous {
+				continue
+			}
+			if _, exists := byFolder[folder]; exists {
+				delete(byFolder, folder)
+				ambiguousFolders[folder] = struct{}{}
+				continue
+			}
 			byFolder[folder] = user
 		}
 	}

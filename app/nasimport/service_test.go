@@ -65,6 +65,37 @@ func TestRunMovesMediaForUploadFolderOwner(t *testing.T) {
 	}
 }
 
+func TestRunLeavesDuplicateUploadFolderUnassigned(t *testing.T) {
+	importDir, mediaDir := t.TempDir(), t.TempDir()
+	sourceDir := filepath.Join(importDir, "shared")
+	if err := os.MkdirAll(sourceDir, 0o750); err != nil {
+		t.Fatal(err)
+	}
+	source := filepath.Join(sourceDir, "photo.jpg")
+	if err := os.WriteFile(source, []byte("ambiguous-media"), 0o640); err != nil {
+		t.Fatal(err)
+	}
+	repository := &recordingRepository{users: []User{
+		{ID: "user-1", UploadFolder: "shared"},
+		{ID: "user-2", UploadFolder: "shared"},
+	}}
+	service, err := New(repository, importDir, mediaDir)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	count, err := service.Run(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if count != 0 || len(repository.media) != 0 {
+		t.Fatalf("imported %d files and saved %d media, want 0", count, len(repository.media))
+	}
+	if _, err := os.Stat(source); err != nil {
+		t.Fatalf("ambiguous source should remain: %v", err)
+	}
+}
+
 func TestRunKeepsSourceWhenSaveFails(t *testing.T) {
 	importDir, mediaDir := t.TempDir(), t.TempDir()
 	source := filepath.Join(importDir, "photo.jpg")
