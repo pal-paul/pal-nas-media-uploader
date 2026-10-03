@@ -34,7 +34,6 @@ import (
 )
 
 var (
-	err    error
 	envVar Environment
 	router *gin.Engine
 )
